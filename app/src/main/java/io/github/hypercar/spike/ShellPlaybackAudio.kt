@@ -89,7 +89,7 @@ class ShellPlaybackAudio {
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
             val builder = AudioRecord.Builder().setAudioSource(8).setAudioFormat(format)
-                .setBufferSizeInBytes(38400)
+                .setBufferSizeInBytes(76800)
             AudioRecord.Builder::class.java.getMethod("setContext", Context::class.java)
                 .invoke(builder, PlaybackAudioContext(context))
             val record = builder.build()
@@ -109,6 +109,7 @@ class ShellPlaybackAudio {
             session = current
             status = "capturing 48000Hz stereo PCM16; $volumeStatus"
             Thread({
+                runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) }
                 try {
                     ParcelFileDescriptor.AutoCloseOutputStream(current.output).use { out ->
                         val bytes = ByteArray(3840) // 20ms, bounded pipe provides backpressure.
@@ -117,6 +118,7 @@ class ShellPlaybackAudio {
                         while (current.live.get()) {
                             val count = record.read(bytes, 0, bytes.size, AudioRecord.READ_BLOCKING)
                             check(count > 0) { "AudioRecord.read=$count" }
+                            if (count < bytes.size) java.util.Arrays.fill(bytes, count, bytes.size, 0)
                             if (!nonzero) nonzero = (0 until count).any { bytes[it].toInt() != 0 }
                             val now = android.os.SystemClock.elapsedRealtime()
                             if (now - lastInspect >= 5_000) {
@@ -127,7 +129,7 @@ class ShellPlaybackAudio {
                                 lastInspect = now
                                 nonzero = false
                             }
-                            out.write(bytes, 0, count)
+                            out.write(bytes, 0, bytes.size)
                         }
                     }
                 } catch (e: Exception) {

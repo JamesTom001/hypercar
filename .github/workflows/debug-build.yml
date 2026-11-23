@@ -1,0 +1,137 @@
+# HyperCar —— 本地补丁 Debug 构建流水线（Fork 用，无需签名 Secret）。
+#
+# 与官方 Build Release APK 的差异：
+#   - 不读取任何 keystore Secret，debug 构建走 AGP 默认 debug 证书；
+#   - 只执行 :app:assembleDebug，产物上传为 Artifact，不发布 GitHub Release；
+#   - 安装前必须先卸载官方签名的 HyperCar（签名不同，无法覆盖安装）。
+#
+# 触发：push 到本仓库任意分支，或 Actions 页手动 Run workflow。
+
+name: Build Debug APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建 Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Rust（aarch64-linux-android 目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 安装 NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: true
+
+      - name: 缓存 cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}
+
+      - name: 安装 cargo-ndk
+        run: command -v cargo-ndk >/dev/null 2>&1 || cargo install cargo-ndk --locked
+
+      - name: 缓存 rust-core 编译产物
+        uses: actions/cache@v4
+        with:
+          path: rust-core/target
+          key: rust-core-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml') }}
+          restore-keys: rust-core-${{ runner.os }}-
+
+      - name: 编译 Rust 核心层 → jniLibs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          set -eu
+          cd rust-core
+          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+          ls -la ../app/src/main/jniLibs/arm64-v8a/
+          test -f ../app/src/main/jniLibs/arm64-v8a/libhypercar_core.so
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 构建 Debug APK
+        run: |
+          set -eu
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+
+      - name: 校验产物并打包
+        id: package
+        env:
+          VERSION: 0.1.0.614
+        run: |
+          set -eu
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -f "$APK" || { echo "::error::未找到 $APK"; exit 1; }
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -l "$APK" | grep -q "lib/arm64-v8a/libhypercar_core.so" \
+              || { echo "::error::APK 内缺少 libhypercar_core.so"; exit 1; }
+          fi
+          NAME="HyperCar-${VERSION}-debug.apk"
+          cp "$APK" "$NAME"
+          SHA=$(sha256sum "$NAME" | cut -d' ' -f1)
+          SIZE=$(du -h "$NAME" | cut -f1)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "已生成 $NAME（$SIZE）"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.name }}
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: 'true'
+
+      - name: 写入运行摘要
+        env:
+          VERSION: 0.1.0.614
+          NAME: ${{ steps.package.outputs.name }}
+          SHA: ${{ steps.package.outputs.sha }}
+          SIZE: ${{ steps.package.outputs.size }}
+        run: |
+          set -eu
+          {
+            echo "### HyperCar ${VERSION}（debug 补丁包）"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| APK | ${NAME} |"
+            echo "| 大小 | ${SIZE} |"
+            echo "| SHA-256 | ${SHA} |"
+            echo
+            echo "> debug 证书签名，安装前需先卸载官方签名版本。"
+          } >> "$GITHUB_STEP_SUMMARY"

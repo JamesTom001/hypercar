@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.view.Surface
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.spike.MapCompat
 import io.github.hypercar.spike.SpikeDisplay
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CoroutineScope
@@ -26,6 +27,7 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     private var displayId = -1
     private var tasksBeforeLaunch: List<MediaTaskWindow.Task>? = null
     private var needsFullscreenReset = false
+    @Volatile private var compatEnabled = false
 
     private data class Request(val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean)
     private data class Attachment(val request: Request, val surface: Surface, val displayId: Int)
@@ -82,6 +84,11 @@ internal class MediaCardProjection(context: Context, private val packageName: St
             if (isCurrent(request)) error.value = "应用当前无法启动"
             return false
         }
+        if (request.expanded) {
+            val compat = runCatching { MapCompat.enable(packageName) }.getOrElse { it.message ?: "am compat 失败" }
+            compatEnabled = true
+            HyperCarRepo.log("VIDEO-CARD: package=$packageName $compat")
+        }
         SpikeShell.connect(app)
         if (!isCurrent(request)) return false
         val previous = runCatching { MediaTaskWindow.snapshot() }.getOrNull()
@@ -94,6 +101,7 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         if (id == null || id <= 0) {
             if (isCurrent(request)) error.value = "无法创建应用画面，请检查 Shizuku"
             HyperCarRepo.log("VIDEO-CARD: display failed package=$packageName result=${created.take(120)}")
+            if (compatEnabled) { runCatching { MapCompat.disable(packageName) }; compatEnabled = false }
             return false
         }
         var launched = false
@@ -183,6 +191,10 @@ internal class MediaCardProjection(context: Context, private val packageName: St
             }
         } finally {
             SpikeShell.releaseDisplay(id)
+            if (compatEnabled) {
+                runCatching { MapCompat.disable(packageName) }
+                compatEnabled = false
+            }
         }
     }
 

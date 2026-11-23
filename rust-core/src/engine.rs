@@ -1292,6 +1292,7 @@ impl AudioPumpThread {
         let audio_guard = shutdown.track_audio_thread();
         std::thread::Builder::new().name("hypercar-audio".into()).spawn(move || {
             let audio_guard = audio_guard;
+            crate::thread_prio::apply("hypercar-audio", -16);
             match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => {
                     if started.send(Ok(())).is_ok() {

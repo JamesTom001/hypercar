@@ -58,7 +58,11 @@ class CarHomeActivity : ComponentActivity() {
             dm.registerDisplayListener(listener, null)
             displayListener = listener
         }
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+        )
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             HyperCarTheme {

@@ -1335,9 +1335,10 @@ object HyperCarRepo {
             }
             override fun onLost(network: Network) {
                 if (network != expected || sessionNetworkMonitor !== this) return
-                log("NET-WATCH: network=#$network lost；终止本轮网络，不切到其他网络")
+                log("NET-WATCH: network=#$network lost；进入 ${NETWORK_LOST_GRACE_MS}ms 宽限观察期，期内恢复则不拆会话")
                 val owner = this
                 scope.launch {
+                    kotlinx.coroutines.delay(NETWORK_LOST_GRACE_MS)
                     autoConnectChanges.lock()
                     try {
                         if (sessionNetworkMonitor === owner && boundNetwork == network) {
@@ -1345,7 +1346,9 @@ object HyperCarRepo {
                             val pending = connectJob
                             pending?.cancel()
                             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
-                            runDisconnect("已知车机 Wi-Fi 已断开")
+                            runDisconnect("已知车机 Wi-Fi 已断开（宽限期内未恢复）")
+                        } else {
+                            log("NET-WATCH: 宽限期内网络已重绑，保留本轮会话，跳过断开")
                         }
                     } finally { autoConnectChanges.unlock() }
                 }
@@ -4077,6 +4080,9 @@ object HyperCarRepo {
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
+
+    /** 弱信号短时衰落（地库/隧道重关联）的观察宽限；期内网络重绑则保留本轮会话。 */
+    private const val NETWORK_LOST_GRACE_MS = 4_000L
 
     /** 掉线自动重连：退避序列（ms）与最大连续尝试次数。 */
 

@@ -55,6 +55,7 @@ mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
 mod shutdown;
+mod thread_prio;
 mod callback_context;
 #[cfg(test)]
 mod wire_compat;
@@ -77,6 +78,7 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("hypercar-core")
+        .on_thread_start(|| crate::thread_prio::apply("hypercar-core", -4))
         .enable_all()
         .build()
         .expect("tokio runtime 创建失败")

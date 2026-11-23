@@ -52,6 +52,7 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
             val outputMime = if (outputHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
             pair.framePeriodUs = 1_000_000L / fps
             pair.initThread = Thread({
+              runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY) }
               try {
                 lifecycle.acquire()
                 pair.lease.set(true)
@@ -178,6 +179,7 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
     }
     private fun startWorkers() {
         decodeThread = Thread({
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY) }
             try {
                 val dec = checkNotNull(decoder)
                 val decoded = MediaCodec.BufferInfo()
@@ -205,6 +207,7 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
             }
         }, "CarWithDecode").apply { isDaemon = true }
         encodeThread = Thread({
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY) }
             try {
                 // Keep draining during close until the decoder releases the Surface producer.
                 var closingAt = 0L

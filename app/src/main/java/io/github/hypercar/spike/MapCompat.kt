@@ -22,6 +22,8 @@ object MapCompat {
 
     private const val CHANGE_UNDEFINED_TO_NOSENSOR = 265451093L
     private const val CHANGE_ANY_ORIENTATION = 265464455L
+    private const val NAME_UNDEFINED_TO_NOSENSOR = "OVERRIDE_UNDEFINED_ORIENTATION_TO_NOSENSOR"
+    private const val NAME_ANY_ORIENTATION = "OVERRIDE_ANY_ORIENTATION"
 
     suspend fun enable(pkg: String): String = run(pkg, play = true)
 
@@ -30,9 +32,19 @@ object MapCompat {
     private suspend fun run(pkg: String, play: Boolean): String {
         if (!ShizukuTools.isReady) return "Shizuku 未就绪，跳过 am compat"
         val action = if (play) "enable" else "disable"
-        val first = ShizukuTools.exec("am compat $action $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", 6_000)
-        val second = ShizukuTools.exec("am compat $action $CHANGE_ANY_ORIENTATION $pkg", 6_000)
-        return "am compat $action $pkg → exit=${first.code}/${second.code} " +
-            "out=${(first.out + " | " + second.out).take(400)}"
+        val targets = listOf(
+            CHANGE_UNDEFINED_TO_NOSENSOR to NAME_UNDEFINED_TO_NOSENSOR,
+            CHANGE_ANY_ORIENTATION to NAME_ANY_ORIENTATION,
+        )
+        val results = targets.flatMap { (id, name) ->
+            listOf(
+                ShizukuTools.exec("am compat $action $id $pkg", 6_000),
+                ShizukuTools.exec("am compat $action $name $pkg", 6_000),
+            )
+        }
+        val detail = results.mapIndexed { index, r ->
+            "${if (index % 2 == 0) "id" else "name"}=(${r.code})${r.out.trim()}${r.err.trim()}"
+        }.joinToString(" | ").take(600)
+        return "am compat $action $pkg → $detail"
     }
 }

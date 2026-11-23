@@ -178,13 +178,26 @@ class SpikeShellService : ISpikeShell.Stub {
                             val msg = "OK id=${vd.display.displayId} flags=0x${candidate.toString(16)} package=$pkg ime=$ime"
                             Log.i(TAG, "createDisplay $msg")
                             SpikeReport.add("SHELL", "createDisplay $msg")
-                            return msg
+                        val missing = buildList {
+                            if ((candidate and ownGroup) == 0) add("OWN_DISPLAY_GROUP")
+                            if ((candidate and alwaysUnlocked) == 0) add("ALWAYS_UNLOCKED")
                         }
-                        Log.w(TAG, "createDisplay(pkg=$pkg) 返回 null，flags=0x${candidate.toString(16)}")
+                        if (missing.isNotEmpty()) {
+                            val warn = "createDisplay WARNING: ${missing.joinToString(" + ")} 未生效，虚拟屏可能与物理主屏同组/被 keyguard 遮挡"
+                            Log.w(TAG, warn)
+                            SpikeReport.add("SHELL", warn)
+                        }
+                        return msg
+                        }
+                        val note = "createDisplay(pkg=$pkg) 返回 null，flags=0x${candidate.toString(16)}"
+                        Log.w(TAG, note)
+                        SpikeReport.add("SHELL", note)
                     } catch (t: Throwable) {
                         lastError = t
                         lastLabel = "pkg=$pkg flags=0x${candidate.toString(16)}"
-                        Log.w(TAG, "createDisplay $lastLabel 失败: $t")
+                        val note = "createDisplay $lastLabel 失败: ${t.javaClass.simpleName}: ${t.message}"
+                        Log.w(TAG, note)
+                        SpikeReport.add("SHELL", note)
                     }
                 }
             }

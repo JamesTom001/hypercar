@@ -162,6 +162,13 @@ object CarUiCaster {
                     log("event=${event?.first ?: "state_changed"} eventElapsedMs=${event?.second ?: SystemClock.elapsedRealtime()} $state")
                     previous = state
                 }
+                // 锁屏/息屏瞬间不主动拆掉并重建源虚拟屏：旧代码收到 SCREEN_OFF 立即 stopLocked()/startLocked()，
+                // 会把 2615 旧屏和编码器释放后新建 2617 新屏，车机看到的就是“跟着锁住再恢复”的一闪。
+                // 这里只记录息屏/锁屏状态；源屏真被系统移除、shell 服务断开或帧停滞时，仍由下面的看门狗恢复。
+                val suspended = power?.isInteractive == false || keyguard?.isDeviceLocked == true
+                if (event?.first == Intent.ACTION_SCREEN_OFF && id > 0 && suspended) {
+                    log("screen-off/locked display=$id；保留现有源屏与编码器，不主动重建（等待真停滞/断线看门狗）")
+                }
                 val originalService = displayService
                 if (recovery == null && originalService != null &&
                     (originalService !== userService || (displays != null && id > 0 && display == null))) {

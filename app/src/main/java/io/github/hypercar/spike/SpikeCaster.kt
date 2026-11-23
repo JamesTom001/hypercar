@@ -187,7 +187,7 @@ class SpikeCaster(
                     Surface.CHANGE_FRAME_RATE_ALWAYS,
                 )
             }
-            val ht = HandlerThread("hypercar-spike-enc")
+            val ht = HandlerThread("hypercar-spike-enc", android.os.Process.THREAD_PRIORITY_DISPLAY)
             thread = ht
             ht.start()
             val handler = Handler(ht.looper)

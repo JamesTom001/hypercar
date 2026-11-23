@@ -98,6 +98,7 @@ impl AacWorker {
         let (results, output) = mpsc::sync_channel(QUEUED_BLOCKS);
         let worker_owner = ownership.clone();
         std::thread::Builder::new().name("hypercar-aac".into()).spawn(move || {
+            crate::thread_prio::apply("hypercar-aac", -16);
             let mut generation = None;
             let mut pcm = AacInput::default();
             let mut ready = Vec::new();

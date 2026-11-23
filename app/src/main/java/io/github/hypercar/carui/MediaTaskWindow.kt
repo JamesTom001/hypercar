@@ -83,18 +83,43 @@ internal object MediaTaskWindow {
         }
     }
 
+    private fun log(message: String) =
+        io.github.hypercar.session.HyperCarRepo.log("VIDEO-CARD: $message")
+
     suspend fun expand(displayId: Int, packageName: String, width: Int, height: Int): Boolean {
-        if (displayId <= 0 || width <= height) return false
-        if (findTask(displayId, packageName) == null) {
-            delay(150)
-            if (findTask(displayId, packageName) == null) return false
+        if (displayId <= 0 || width <= height) {
+            log("expand reject display=$displayId ${width}x$height（非横屏尺寸）")
+            return false
         }
-        if (!ShizukuTools.exec("wm set-display-windowing-mode -d $displayId 5", 2_000).ok) return false
-        val task = findTask(displayId, packageName) ?: return false
-        if (!ShizukuTools.exec("am task resize ${task.id} 0 0 $width $height", 2_000).ok) return false
+        var task = findTask(displayId, packageName)
+        if (task == null) {
+            delay(150)
+            task = findTask(displayId, packageName)
+        }
+        if (task == null) {
+            log("expand task-not-found display=$displayId package=$packageName")
+            logStackRaw(displayId, packageName)
+            return false
+        }
+        val freeform = ShizukuTools.exec("wm set-display-windowing-mode -d $displayId 5", 2_000)
+        log("expand freeform-mode display=$displayId exit=${freeform.code} out=${freeform.out.trim()} err=${freeform.err.trim()}")
+        task = findTask(displayId, packageName) ?: task
+        val resize = ShizukuTools.exec("am task resize ${task.id} 0 0 $width $height", 2_000)
+        log("expand resize task=${task.id} display=$displayId ${width}x$height exit=${resize.code} out=${resize.out.trim()} err=${resize.err.trim()}")
+        delay(150)
         val mode = ShizukuTools.exec("wm get-display-windowing-mode -d $displayId", 2_000)
-        return mode.ok && mode.out.contains("windowing mode=freeform") &&
-            findTask(displayId, packageName)?.bounds == "[0,0][$width,$height]"
+        val finalTask = findTask(displayId, packageName)
+        log("expand final display=$displayId mode=${mode.code}:${mode.out.trim()} task=${finalTask?.id} bounds=${finalTask?.bounds} original=${task.bounds}")
+        logStackRaw(displayId, packageName)
+        val boundsMatch = finalTask?.bounds == "[0,0][$width,$height]"
+        return resize.ok && boundsMatch
+    }
+
+    private suspend fun logStackRaw(displayId: Int, packageName: String) {
+        val raw = readStackRaw() ?: return
+        for (line in raw.lineSequence()) {
+            if (line.contains(packageName) || line.startsWith("RootTask ")) log("stack: $line")
+        }
     }
 
     suspend fun fullscreen(
@@ -115,4 +140,7 @@ internal object MediaTaskWindow {
 
     private suspend fun readStackList(): String? =
         ShizukuTools.exec("am stack list", 2_000).let { if (it.ok) it.out else null }
+
+    private suspend fun readStackRaw(): String? =
+        ShizukuTools.exec("am stack list", 2_000).let { if (it.ok) it.out else it.err }
 }
