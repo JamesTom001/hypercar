@@ -101,7 +101,7 @@ class ShellPlaybackAudio {
             check(record.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord not initialized" }
             record.startRecording()
             check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "not recording" }
-            android.util.Log.i("HyperCar", "CARUI-AUDIO: record buffer=${record.bufferSizeInBytes}B rate=${record.sampleRate} channels=${record.channelCount}")
+            android.util.Log.i("HyperCar", "CARUI-AUDIO: record buffer=${captureBufferBytes}B rate=${record.sampleRate} channels=${record.channelCount}")
             val captureVolume = CaptureVolume(context)
             volume = captureVolume
             val volumeStatus = captureVolume.acquire()
