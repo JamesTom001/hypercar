@@ -942,6 +942,24 @@ private fun AppTile(
     }
 }
 
+private fun mediaSurfaceListener(
+    projection: MediaCardProjection,
+    expanded: Boolean,
+) = object : android.view.TextureView.SurfaceTextureListener {
+    override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
+        projection.show(texture, width, height, expanded)
+
+    override fun onSurfaceTextureSizeChanged(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
+        projection.show(texture, width, height, expanded)
+
+    override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+        projection.hide(texture)
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
+}
+
 /**
  * 音乐 App 面板（2026-11-01）：把音乐虚显的画面直接铺在这张卡片里，
  * 触摸按比例换算成虚显像素后经 SpikeShell 注入，于是可以在车机上操作它的
@@ -980,21 +998,12 @@ private fun ProjectedMediaPanel(
                         }
                         true
                     }
-                    surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
-                            projection.show(texture, width, height, expanded)
-
-                        override fun onSurfaceTextureSizeChanged(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
-                            projection.show(texture, width, height, expanded)
-
-                        override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
-                            projection.hide(texture)
-                            return true
-                        }
-
-                        override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
-                    }
+                    surfaceTextureListener = mediaSurfaceListener(projection, expanded)
                 }
+            },
+            update = { view ->
+                // 面板在卡片/展开态之间复用 View 时，刷新闭包里的 expanded，避免旧卡片回调把展开任务回收掉。
+                view.surfaceTextureListener = mediaSurfaceListener(projection, expanded)
             },
             onRelease = { view -> view.surfaceTexture?.let(projection::hide) },
         )

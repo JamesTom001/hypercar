@@ -1,4 +1,4 @@
-# HyperCar 0.1.0.614 六轮补丁说明（debug 出包）
+# HyperCar 0.1.0.614 七轮补丁说明（debug 出包）
 
 基线：上游 tag `v0.1.0.614`（versionCode 10710），保留 614 全部新功能（短视频 App
 投影、投影选择器、投影时暂停本地音乐等）。本机无工具链，由 Actions `debug-build.yml`
@@ -46,6 +46,14 @@ bounds / freeform 模式未成功，且 Android 12 不认识五轮传入的兼�
 - `ShellPlaybackAudio.kt`：采集缓冲 38400 → 76800 字节（200ms）；短读块补零后按完整帧写出。
 - `SplitPlaybackAudio.kt`：短读块补零、按完整缓冲写出。
 
+### 七轮：展开态回收保护与音频短时欠载容忍
+
+- `carui/MediaCardProjection.kt`：展开面板收到旧卡片迟到的 `show(false)` 时不再释放横屏任务、重建竖屏虚显；新增 show 入口诊断，记录视图尺寸、横屏状态、texture 身份和现有附件状态。
+- `carui/CarHomeScreen.kt`：`AndroidView.update` 中刷新 SurfaceTextureListener，面板复用 View 时避免旧闭包仍按卡片态回调。
+- `spike/ShellPlaybackAudio.kt`：REMOTE_SUBMIX 采集缓冲提到约 800ms，记录实际 AudioRecord 缓冲、短读次数和欠载字节；URGENT_AUDIO 提级失败写入日志。
+- `spike/SplitPlaybackAudio.kt`：两条策略音频通道分别累计短读次数与欠载字节。
+- `rust-core/src/audio_pacing.rs`：短时 worker 调度延迟时保留最多两个就绪 PCM 块，避免一次唤醒延后就直接过期成静音。
+
 ### 弱信号宽限
 - `session/HyperCarRepo.kt`：`onLost` 增加 4000ms 宽限期；期内网络重绑则保留会话，
   超时未恢复再断开。
@@ -55,7 +63,7 @@ bounds / freeform 模式未成功，且 Android 12 不认识五轮传入的兼�
 - `.github/workflows/debug-build.yml`：JDK17 + Rust aarch64-linux-android + NDK r27c +
   cargo-ndk 编译核心层，`:app:assembleDebug`，产物 `HyperCar-0.1.0.614-debug.apk`。
 - 移除官方 `android-ci.yml`（缺签名 Secret 会直接失败）。
-- `versionCode` 10710 → 10714；`versionName` 保持 0.1.0.614。
+- `versionCode` 10710 → 10715；`versionName` 保持 0.1.0.614。
 - debug 证书签名：安装前必须先卸载官方签名版本。
 
 ## 日志判断要点

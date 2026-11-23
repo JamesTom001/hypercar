@@ -35,8 +35,17 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     fun show(texture: SurfaceTexture, viewWidth: Int, viewHeight: Int, expanded: Boolean) {
         if (closed || viewWidth <= 0 || viewHeight <= 0) return
         val viewport = if (expanded) size.expanded(viewWidth, viewHeight) else size
-        texture.setDefaultBufferSize(viewport.width, viewport.height)
         val request = Request(texture, viewport, expanded && viewport.width > viewport.height)
+        val existing = attachment
+        HyperCarRepo.log("VIDEO-CARD: show package=$packageName view=${viewWidth}x${viewHeight} expanded=$expanded viewport=${viewport.width}x${viewport.height} texture=${System.identityHashCode(texture)} display=$displayId existingExpanded=${existing?.request?.expanded} desiredSame=${desired == request}")
+        // 旧首页卡片的 SurfaceTexture 在展开面板替换过程中可能迟到一次 show(false)。
+        // 此时不应把已经展开的应用任务回收到竖屏卡片；保持现有展开附件，等待显式 close/hide。
+        if (displayId > 0 && existing?.request?.expanded == true && !request.expanded) {
+            HyperCarRepo.log("VIDEO-CARD: package=$packageName stale card callback ignored display=$displayId; keeping expanded panel")
+            desired = existing.request
+            return
+        }
+        texture.setDefaultBufferSize(viewport.width, viewport.height)
         if (desired == request) return
         desired = request
         error.value = null

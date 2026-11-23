@@ -261,10 +261,16 @@ pub(crate) fn current_pcm_due(scheduled: Instant, missed_frames: u64, rate: u32)
 
 pub(crate) const RECOVERY_DEADLINE: Duration = Duration::from_millis(60);
 
-/// Preserve one missed block and the current block when both already exist.
+/// Preserve up to two ready blocks when the audio worker is delayed by a short preemption.
+/// A single missed block was not enough on the Mate 60 foreground-app preemption cases.
 pub(crate) fn recoverable_source_frames(late: Duration, rate: u32, queued: usize) -> u64 {
     let slot = period(rate);
-    if late >= slot && late < slot * 2 && queued >= 704 { 352 } else { 0 }
+    const BLOCK: usize = 352;
+    if late >= slot && late < slot * 3 && queued >= BLOCK * 3 {
+        ((queued / BLOCK).min(2) * BLOCK) as u64
+    } else {
+        0
+    }
 }
 
 pub(crate) fn interval(rate: u32) -> tokio::time::Interval {
@@ -309,12 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn short_recovery_requires_one_missed_slot_and_two_ready_blocks() {
+    fn short_recovery_keeps_two_ready_blocks_for_a_short_worker_stall() {
         let rate = 48_000;
         let slot = period(rate);
-        assert_eq!(recoverable_source_frames(slot, rate, 704), 352);
-        assert_eq!(recoverable_source_frames(slot * 2 - Duration::from_nanos(1), rate, 704), 352);
-        for (late, queued) in [(slot - Duration::from_nanos(1), 704), (slot, 703), (slot * 2, 704), (slot * 5, 4096)] {
+        assert_eq!(recoverable_source_frames(slot, rate, 1056), 704);
+        assert_eq!(recoverable_source_frames(slot * 3 - Duration::from_nanos(1), rate, 1056), 704);
+        for (late, queued) in [(slot - Duration::from_nanos(1), 1056), (slot, 704), (slot * 3, 1056), (slot * 5, 4096)] {
             assert_eq!(recoverable_source_frames(late, rate, queued), 0);
         }
     }
