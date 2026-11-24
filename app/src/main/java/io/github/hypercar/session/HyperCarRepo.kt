@@ -54,6 +54,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -94,6 +96,7 @@ object HyperCarRepo {
     internal val oldDeviceReadiness = _oldDeviceReadiness.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mediaLog = MediaDiagnosticLog { log(it) }
     private val mediaSummaryWrites = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var mediaSummaryStore: MediaSummaryStore? = null
 
@@ -104,8 +107,10 @@ object HyperCarRepo {
     private var iap2: Iap2Coordinator? = null
 
     @Volatile private var wifiJoiner: WifiJoiner? = null
+    private val hotspotHandoff = CarHotspotReconnect.Handoff<WifiJoiner, Network>()
     private val wifiRecoveryLease = io.github.hypercar.net.WifiRecoveryLease<WifiJoiner> { request ->
         if (request.release() == null && wifiJoiner === request) {
+            hotspotHandoff.clear(request)
             wifiJoiner = null
             joinedNetwork = null
             joinedSsid = null
@@ -164,9 +169,11 @@ object HyperCarRepo {
             autoConnectChanges.lock()
             try {
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
+                if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets ||
+                    !cachedHotspotMatchesTarget())
                     throw CancellationException("旧核心启动结果已失效")
                 val callbackOwner = engineCallbacks.begin()
+                io.github.hypercar.carui.CarReceiverUi.reset()
                 log("CORE-OWNER: start owner=$callbackOwner attempt=$attempt network=${sockets.network}")
                 val config = org.json.JSONObject(configure()).put("carwith_source_owner", attempt)
                 val stationMac = wifiStationSnapshot?.takeIf { it.first == attempt && it.second == sockets.network }?.third
@@ -182,7 +189,13 @@ object HyperCarRepo {
                             if (connectionDiagnostics.mediaEvent(attempt, callbackOwner, line)) {
                                 mediaSummaryWrites.trySend(Unit)
                             }
-                            scope.launch { rustListener.onLog(line) }
+                            mediaLog.offer(line)
+                            return
+                        }
+                        if (line.startsWith("VIDEO-FEEDBACK: ") || line.startsWith("VIDEO-QUEUE: ") ||
+                            line.startsWith("VIDEO-QOS: ") || line.startsWith("VIDEO: reset source ") ||
+                            line.startsWith("VIDEO: keepAlive written ") || line.startsWith("CLUSTER: keepAlive written ")) {
+                            mediaLog.offer(line)
                             return
                         }
                         if (!line.startsWith("AUDIO-UDP-DROP: ")) {
@@ -293,6 +306,13 @@ object HyperCarRepo {
     @Volatile private var sessionReceiverMac: String? = null
     @Volatile private var sessionWifiSsid: String? = null
     private val announcedHotspot = AtomicReference<Pair<Long, BluetoothHotspot>?>(null)
+    private class PendingCarHotspot(
+        val attempt: Long,
+        val receiver: String,
+        val network: Network,
+        val credentials: CarHotspotReconnect.Credentials,
+    )
+    private val pendingCarHotspot = AtomicReference<PendingCarHotspot?>(null)
     @Volatile private var wifiStationSnapshot: Triple<Long, Network, String>? = null
     private var wifiReconnectMonitor: ConnectivityManager.NetworkCallback? = null
     private var wifiReconnectCheck: Job? = null
@@ -354,10 +374,13 @@ object HyperCarRepo {
 
     /** 持有移交 Rust 的网络句柄（推流期间不能释放）。 */
     private val ctrlNetworkLock = Any()
+    /** VW may advertise on the current Wi-Fi before identifying it as the car's network. */
+    @Volatile private var unverifiedInvitationNetwork: Network? = null
     @Volatile
     private var boundNetwork: Network? = null
         set(value) = synchronized(ctrlNetworkLock) {
             if (field != value) {
+                unverifiedInvitationNetwork = null
                 val advertiser = ctrlAdvertiser
                 if (advertiser == null) field = value else synchronized(advertiser) {
                     field = value
@@ -375,6 +398,7 @@ object HyperCarRepo {
             appCtx = app
             val summaries = MediaSummaryStore(java.io.File(app.filesDir, "hypercar-media-summaries.txt"))
             mediaSummaryStore = summaries
+            scope.launch { mediaLog.run() }
             scope.launch {
                 for (signal in mediaSummaryWrites) {
                     runCatching { summaries.save(connectionDiagnostics.mediaSummaries()) }
@@ -932,12 +956,15 @@ object HyperCarRepo {
 
     private val targetCarChanges = Any()
 
-    /** 切换目标立即更新后续入站过滤；只取消尚未建立会话的出站拨号。 */
+    private fun cachedHotspotMatchesTarget(): Boolean =
+        hotspotHandoff.matchesTarget(SettingsStore.targetCarMac, established = sessionHadLink)
+
+    /** 切换目标立即更新入站过滤，并退出旧目标尚未激活的缓存连接。 */
     fun updateTargetCar(mac: String?, name: String?) = synchronized(targetCarChanges) {
         val target = mac?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
-        if (!target.orEmpty().equals(SettingsStore.targetCarMac.orEmpty(), ignoreCase = true)) {
+        val changed = !target.orEmpty().equals(SettingsStore.targetCarMac.orEmpty(), ignoreCase = true)
+        if (changed) {
             SettingsStore.lastAirplayEndpoint = "" // Legacy endpoint had no receiver association.
-
         }
         CarProfileGuard.stop()
         SettingsStore.setTargetCar(target, name?.takeIf { target != null && it.isNotBlank() })
@@ -946,7 +973,25 @@ object HyperCarRepo {
         announcedHotspot.set(null)
         standbyEndpoint.set(null)
         iap2?.onTargetChanged()
-        appContext()?.let { startAutomaticListening(it) }
+        appContext()?.let { context ->
+            if (!changed) startAutomaticListening(context)
+            else {
+                val attempt = connectionAttemptId
+                scope.launch {
+                    autoConnectChanges.withLock {
+                        if (connectionAttemptId == attempt && !cachedHotspotMatchesTarget()) {
+                            sessionSockets?.invalidate()
+                            val pending = connectJob
+                            connectJob = null
+                            pending?.cancel()
+                            withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
+                            runDisconnect("目标已切换，撤销尚未建立会话的缓存热点")
+                        }
+                    }
+                    startAutomaticListening(context)
+                }
+            }
+        }
         io.github.hypercar.settings.SettingsRevision.bump()
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
@@ -1243,12 +1288,21 @@ object HyperCarRepo {
         if (!profile.advertiseOnCurrentWifi) { resumeKnownCarNetwork(context, advertiser); return }
         val target = SettingsStore.targetCarMac
         if (!HeadUnitActivationPolicy.canAdvertiseCurrentWifi(profile, target, iap2?.activePeerAddress)) return
-        val ssid = currentWifiSsid(context) ?: return
-        val network = knownWifiNetwork(context, ssid) ?: return
+        val discovery = hotspotHandoff.discoveryToken()
+        val ssid = if (discovery != null) currentWifiSsid(context) else null
+        val network = ssid?.let { knownWifiNetwork(context, it) }
         autoConnectChanges.lock()
         try {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             if (!sessionLive.get() || connectionAttemptId != attempt || ctrlAdvertiser !== advertiser) return
+            if (!target.equals(SettingsStore.targetCarMac, ignoreCase = true)) return
+            if (!canApplyWifiDiscovery(advertiser, discovery)) return
+            val verified = boundNetwork?.takeUnless { it == unverifiedInvitationNetwork }
+            if (verified != null) {
+                joinedSsid?.let { advertiser.ensureForNetwork(it, network = verified) }
+                return
+            }
+            if (ssid == null || network == null) return
             val changed = boundNetwork != network || joinedSsid != ssid || wifiReceiverMac != target
             if (changed) {
                 val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
@@ -1260,6 +1314,7 @@ object HyperCarRepo {
                 wifiReceiverMac = target
                 sessionWifiSsid = ssid
                 boundNetwork = network
+                unverifiedInvitationNetwork = network.takeUnless { knownWifiReceiver(ssid).equals(target, ignoreCase = true) }
                 joinedNetwork = network
                 joinedSsid = ssid
                 watchSessionNetwork(context, network)
@@ -1272,23 +1327,48 @@ object HyperCarRepo {
     private fun usableCtrlInvitation(advertiser: CarPlayCtrlAdvertiser): CarPlayCtrlAdvertiser.Invitation? {
         val invite = advertiser.lastInvitation ?: return null
         val now = SystemClock.elapsedRealtime()
-        if (HeadUnitActivationPolicy.acceptsInvitation(headUnitProfile, invite.receivedAtMillis, now,
-                boundNetwork != null && invite.network == boundNetwork)) return invite
+        val sameNetwork = boundNetwork != null && invite.network == boundNetwork
+        if (cachedHotspotMatchesTarget() && (hotspotHandoff.provisionalNetwork == null || sameNetwork) &&
+            HeadUnitActivationPolicy.acceptsInvitation(headUnitProfile, invite.receivedAtMillis, now, sameNetwork)) return invite
         if (advertiser.discardInvitation(invite)) {
-            log("CTRL: 忽略过期/跨网络邀请 profile=${headUnitProfile.id} age=${now - invite.receivedAtMillis}ms inviteNetwork=${invite.network} currentNetwork=$boundNetwork，继续广播等本轮邀请")
+            log("CTRL: 忽略过期/跨网络/旧目标邀请 profile=${headUnitProfile.id} age=${now - invite.receivedAtMillis}ms inviteNetwork=${invite.network} currentNetwork=$boundNetwork")
         }
         return null
     }
 
+    /** Called under autoConnectChanges by both known-network discovery paths. */
+    private fun canApplyWifiDiscovery(advertiser: CarPlayCtrlAdvertiser, token: Any?): Boolean {
+        val provisional = hotspotHandoff.provisionalNetwork
+        if (provisional != null && boundNetwork == provisional && cachedHotspotMatchesTarget()) {
+            joinedSsid?.let { advertiser.ensureForNetwork(it, network = provisional) }
+        }
+        return hotspotHandoff.canCommitDiscovery(token)
+    }
+
     private suspend fun resumeKnownCarNetwork(context: Context, advertiser: CarPlayCtrlAdvertiser) {
         val attempt = connectionAttemptId
-        val ssid = currentWifiSsid(context) ?: return
-        val mac = knownWifiReceiver(ssid) ?: return
-        val network = knownWifiNetwork(context, ssid) ?: return
+        val discovery = hotspotHandoff.discoveryToken()
+        val retainedRequest = wifiJoiner
+        val retainedNetwork = retainedRequest?.let { request ->
+            request.currentNetwork?.takeIf { request.ownsLiveRequest(it) && request.isReady(it) }
+        }
+        val retainedSsid = joinedSsid?.takeIf {
+            boundNetwork == null && retainedNetwork != null && joinedNetwork == retainedNetwork &&
+                retainedRequest?.requiresDifferentHotspot(it) == false
+        }
+        val ssid = if (discovery != null) retainedSsid ?: currentWifiSsid(context) else null
+        val mac = ssid?.let(::knownWifiReceiver)
+        val network = if (ssid != null && mac != null)
+            retainedNetwork?.takeIf { retainedSsid != null } ?: knownWifiNetwork(context, ssid) else null
         autoConnectChanges.lock()
         try {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             if (!sessionLive.get() || connectionAttemptId != attempt || ctrlAdvertiser !== advertiser) return
+            if (!canApplyWifiDiscovery(advertiser, discovery) || ssid == null || mac == null || network == null) return
+            if (retainedSsid != null && (retainedRequest == null || wifiJoiner !== retainedRequest ||
+                    !wifiRecoveryLease.isRetained(retainedRequest) || !retainedRequest.ownsLiveRequest(network) ||
+                    !retainedRequest.isReady(network) ||
+                    knownWifiReceiver(ssid) != mac)) return
             val changed = boundNetwork != network || joinedSsid != ssid || wifiReceiverMac != mac
             if (changed) {
                 val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
@@ -1306,9 +1386,41 @@ object HyperCarRepo {
                 joinedSsid = ssid
                 log("WIFI-RESUME: 绑定已知车机 Wi-Fi 并恢复 ctrl 广播，使用本车凭证")
             }
+            unverifiedInvitationNetwork = null
             // 同一网络不会反复重注册；上次注册失败则允许重试。
             advertiser.ensureForNetwork(ssid, network = network)
         } finally { autoConnectChanges.unlock() }
+    }
+
+    /** Both Android loss callbacks are serialized here. A cached association is optional until activation. */
+    private fun releaseLostProvisionalHotspot(
+        context: Context, network: Network, expectedRequest: WifiJoiner? = null,
+    ): Boolean {
+        val request = hotspotHandoff.provisionalRequest(network) ?: return false
+        if (boundNetwork != network || wifiJoiner !== request ||
+            (expectedRequest != null && request !== expectedRequest)) return false
+        wifiJoiner = null
+        clearSessionWifiBinding(context)
+        request.release(keepConnected = false)
+        hotspotHandoff.clear(request)
+        log("CAR-WIFI-RESUME: 缓存热点已断开，保留本轮蓝牙监听，等待新热点参数或车机邀请")
+        return true
+    }
+
+    /** Called with autoConnectChanges held, before replacing a Wi-Fi association. */
+    private fun clearSessionWifiBinding(context: Context) {
+        val network = boundNetwork
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val monitor = sessionNetworkMonitor
+        sessionNetworkMonitor = null
+        monitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        boundNetwork = null // Also retires the ctrl listener and any invitation tied to this network.
+        joinedNetwork = null
+        joinedSsid = null
+        wifiReceiverMac = null
+        sessionWifiSsid = null
+        wifiStationSnapshot = null
+        if (network != null && cm?.boundNetworkForProcess == network) runCatching { cm.bindProcessToNetwork(null) }
     }
 
     private fun watchSessionNetwork(context: Context, expected: Network) {
@@ -1335,20 +1447,19 @@ object HyperCarRepo {
             }
             override fun onLost(network: Network) {
                 if (network != expected || sessionNetworkMonitor !== this) return
-                log("NET-WATCH: network=#$network lost；进入 ${NETWORK_LOST_GRACE_MS}ms 宽限观察期，期内恢复则不拆会话")
                 val owner = this
                 scope.launch {
-                    kotlinx.coroutines.delay(NETWORK_LOST_GRACE_MS)
                     autoConnectChanges.lock()
                     try {
                         if (sessionNetworkMonitor === owner && boundNetwork == network) {
+                            if (releaseLostProvisionalHotspot(context, network)) return@launch
+                            lastWifiFlapElapsed.set(SystemClock.elapsedRealtime())
+                            log("NET-WATCH: network=#$network lost；终止本轮网络，不切到其他网络（抖动保活界面 20s）")
                             sessionSockets?.takeIf { it.network == expected }?.invalidate()
                             val pending = connectJob
                             pending?.cancel()
                             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
-                            runDisconnect("已知车机 Wi-Fi 已断开（宽限期内未恢复）")
-                        } else {
-                            log("NET-WATCH: 宽限期内网络已重绑，保留本轮会话，跳过断开")
+                            runDisconnect("已知车机 Wi-Fi 已断开", flap = true)
                         }
                     } finally { autoConnectChanges.unlock() }
                 }
@@ -1527,7 +1638,6 @@ object HyperCarRepo {
                 }, detail = if (event == CarPlayCtrlAdvertiser.Event.REGISTERED) port.toString() else "")
             }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId,
                 traceDiscovery = ctrlDiscoveryTrace::record,
-                deviceInfoEnabled = { SettingsStore.carPlayDeviceInfoModelEnabled },
                 onCtrlEpochChanged = { connectionDiagnostics.newCtrlEpoch(diagnosticId) }, onMdnsObservation = { family, port ->
                 connectionDiagnostics.observe(diagnosticId,
                     if (port != null) ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
@@ -1690,6 +1800,9 @@ object HyperCarRepo {
             // 它连 iAP2 都不再发起（10-25 日志：10 分钟里 0 次连入）。所以这里改成
             // 「超时只提示、不拆链，继续下一轮等」，直到用户断开 / ACL 断开 / 拿到端点。
             var invitationOnly = false
+            var cachedWifiReceiver = SettingsStore.targetCarMac?.takeIf {
+                manual && canRestoreCarHotspot(context, p.id, it)
+            }
             suspend fun waitForInvitation(
                 reason: String,
             ) {
@@ -1721,6 +1834,7 @@ object HyperCarRepo {
                     endpoint =
                         awaitUsableEndpoint(
                             context, coordinator, lastSeen, advertiser, invitationOnly, usesFallbackPhoneIdentity,
+                            cachedWifiReceiver.also { cachedWifiReceiver = null },
                         )
                             ?: if (invitationOnly) null else gatewayFallbackEndpoint(context, lastSeen.get())
                     if (endpoint == null) {
@@ -1910,6 +2024,9 @@ object HyperCarRepo {
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     if (!sessionLive.get() || connectionAttemptId != diagnosticId || sessionSockets !== sockets) return
                     engineCallbacks.retire()
+                    SettingsStore.receiverMaxFps = null
+                    io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
+                    io.github.hypercar.carui.CarReceiverUi.reset()
                     // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
                     // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                     streaming = false
@@ -2006,7 +2123,11 @@ object HyperCarRepo {
         reason: String,
         keepListening: Boolean = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect, automaticPauseRemaining > 0),
         graceful: Boolean = false,
+        flap: Boolean = false,
     ) {
+        val networkFlap = flap ||
+            (SystemClock.elapsedRealtime() - lastWifiFlapElapsed.get() <= WIFI_FLAP_WINDOW_MILLIS && !userDisconnectRequested)
+        if (networkFlap) lastWifiFlapElapsed.set(0)
         carWithEntries.retire(connectionAttemptId)
         videoCapabilityGeneration.incrementAndGet()
         SettingsStore.videoCapabilities.clear()
@@ -2029,8 +2150,8 @@ object HyperCarRepo {
         finishDiagnostic("STOPPED", reason)
         val hadLink = sessionHadLink
         val receiver = retryReceiver()
-        releaseSessionResources(keepListening, graceful)
-        log("SESSION: 已断开（$reason）")
+        releaseSessionResources(keepListening || networkFlap, graceful, holdUi = networkFlap, holdReason = reason)
+        log("SESSION: 已断开（$reason）${if (networkFlap) " [网络抖动：界面保活待重连]" else ""}")
         _snapshots.update { s ->
             s.copy(
                 link = LinkState.Idle,
@@ -2041,7 +2162,7 @@ object HyperCarRepo {
                 logRecording = logRecording,
             )
         }
-        scheduleAutoReconnect(reason, hadLink, receiver)
+        scheduleAutoReconnect(reason, hadLink, receiver, urgent = networkFlap)
         if (SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
     }
 
@@ -2051,7 +2172,7 @@ object HyperCarRepo {
     private fun retryReceiver(): String? = wifiReceiverKey()?.let { "${headUnitProfile.id}:$it" }
 
     /** Bounded recovery continues through failed retries, replenished only by stable video. */
-    private fun scheduleAutoReconnect(reason: String, hadLink: Boolean, receiver: String?) {
+    private fun scheduleAutoReconnect(reason: String, hadLink: Boolean, receiver: String?, urgent: Boolean = false) {
         if (!automaticConnectionAllowed || userDisconnectRequested) return
         val ctx = appContext() ?: return
         val retry = reconnectBudget.failed(receiver, hadLink, SystemClock.elapsedRealtime())
@@ -2060,7 +2181,7 @@ object HyperCarRepo {
             return
         }
         val owner = connectionAttemptId
-        val retryDelay = retry.delayMs
+        val retryDelay = if (urgent) minOf(retry.delayMs, 800L) else retry.delayMs
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             log("RECONNECT: $reason——${retryDelay}ms 后重试（${retry.number}/${ReconnectBudget.MAX_RETRIES}）")
@@ -2078,8 +2199,13 @@ object HyperCarRepo {
     }
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
-    private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
+    private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false,
+        holdUi: Boolean = false, holdReason: String = "") {
         engineCallbacks.retire()
+        pendingCarHotspot.set(null)
+        SettingsStore.receiverMaxFps = null
+        io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
+        io.github.hypercar.carui.CarReceiverUi.reset()
         val advertised = announcedHotspot.getAndSet(null)
         val requestPeer = advertised?.second?.takeIf {
             it.applies(advertised.first, connectionAttemptId, iap2?.activePeerAddress, SettingsStore.targetCarMac) &&
@@ -2099,7 +2225,9 @@ object HyperCarRepo {
         // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
         sessionUiJob?.cancel()
         sessionUiJob = null
-        CarUiCaster.stopAsync()
+        // 网络抖动：先保活首页虚显+编码器 20s，重连后直接复用，避免车机黑屏和手机端退出。
+        if (!holdUi || !CarUiCaster.holdForReconnect(holdReason)) CarUiCaster.stopAsync()
+        else log("CARUI: 抖动保活首页虚显，等待重连复用（20s 超时）")
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
         runCatching {
             if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
@@ -2126,7 +2254,8 @@ object HyperCarRepo {
         sessionNetworkMonitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         sessionNetworkMonitor = null
         val request = wifiJoiner
-        val retainNetwork = request?.release()
+        val provisional = boundNetwork?.let(hotspotHandoff::provisionalRequest)
+        val retainNetwork = request?.release(keepConnected = request !== provisional && cachedHotspotMatchesTarget())
         if (request != null && retainNetwork != null) {
             request.unbindProcess()
             wifiRecoveryLease.retain(request, requestReceiver.orEmpty())
@@ -2134,6 +2263,7 @@ object HyperCarRepo {
             log("WIFI-LEASE: CarPlay 暂停/结束，保留已连接车机热点；仅解绑进程，不撤销热点请求")
         } else {
             releaseRetainedWifi()
+            request?.let(hotspotHandoff::clear)
             wifiJoiner = null
             joinedSsid = null
             joinedNetwork = null
@@ -2373,6 +2503,7 @@ object HyperCarRepo {
             hasAddress = link.linkAddresses.any { !it.address.isAnyLocalAddress && !it.address.isLoopbackAddress && !it.address.isMulticastAddress },
             routeToPeer = link.routes.any { it.destination.prefixLength > 0 && it.destination.contains(peer) })
         if (!matches || (cm.boundNetworkForProcess != network && !cm.bindProcessToNetwork(network))) return null
+        unverifiedInvitationNetwork = null
         log("WIFI-REUSE: 已核实邀请来源，沿用车机网络 #$network")
         return network
     }
@@ -2380,7 +2511,8 @@ object HyperCarRepo {
     private suspend fun joinAndBindLocked(context: Context, endpoint: CarPlayEndpoint,
         latestDeviceIdentifier: () -> String?, attempt: Long): Network? {
         fun ensureCurrent() {
-            if (!sessionLive.get() || connectionAttemptId != attempt) throw CancellationException("旧车机入网结果已失效")
+            if (!sessionLive.get() || connectionAttemptId != attempt || !cachedHotspotMatchesTarget())
+                throw CancellationException("旧车机入网结果已失效")
         }
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         if (endpoint.fromInvite) {
@@ -2405,7 +2537,10 @@ object HyperCarRepo {
                 val association = request.currentNetwork
                 if (association != null && request.ownsLiveRequest(association)) {
                     val confirmedSame = association == matchingAssociation
-                    if (confirmedSame || !request.requiresDifferentHotspot(endpoint.ssid)) {
+                    val freshCredentialsReplaceCached = request === hotspotHandoff.cachedRequest &&
+                        endpoint.passphrase != null && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt)) &&
+                        !request.ownsHotspot(association, endpoint.ssid, endpoint.passphrase)
+                    if (!freshCredentialsReplaceCached && (confirmedSame || !request.requiresDifferentHotspot(endpoint.ssid))) {
                         protectedSameAssociation = true
                         // All live requests are protected, not only those parked after a stop.
                         // Missing credentials/capabilities are not evidence of a different AP.
@@ -2421,6 +2556,11 @@ object HyperCarRepo {
                         request.release(keepConnected = false)
                         releaseRetainedWifi()
                         if (wifiJoiner === request) wifiJoiner = null
+                        hotspotHandoff.clear(request)
+                        if (freshCredentialsReplaceCached) {
+                            if (reuse == association) reuse = null
+                            if (confirmedSame) protectedSameAssociation = false
+                        }
                     }
                 }
             }
@@ -2429,10 +2569,12 @@ object HyperCarRepo {
                 // Keep a specifier request owning this network alive; retire callbacks for other links.
                 if (wifiJoiner?.ownsBinding(reuse) == false && wifiJoiner?.ownsLiveRequest(reuse) == false) {
                     if (wifiJoiner?.release() != null) return null
+                    wifiJoiner?.let(hotspotHandoff::clear)
                     wifiJoiner = null
                 }
                 if (cm.boundNetworkForProcess != reuse && !cm.bindProcessToNetwork(reuse)) return null
                 boundNetwork = reuse
+                unverifiedInvitationNetwork = null
                 joinedNetwork = reuse
                 joinedSsid = endpoint.ssid?.takeIf { it.isNotBlank() } ?: joinedSsid
                 watchSessionNetwork(context, reuse)
@@ -2450,6 +2592,7 @@ object HyperCarRepo {
             sessionNetworkMonitor?.let { runCatching { cm.unregisterNetworkCallback(it) } }
             sessionNetworkMonitor = null
             val previousNetwork = boundNetwork
+            wifiJoiner?.let(hotspotHandoff::clear)
             wifiJoiner = null
             if (previousNetwork != null && cm.boundNetworkForProcess == previousNetwork)
                 runCatching { cm.bindProcessToNetwork(null) }
@@ -2457,23 +2600,8 @@ object HyperCarRepo {
             joinedNetwork = null
             joinedSsid = null
         } finally { autoConnectChanges.unlock() }
-        lateinit var joiner: WifiJoiner
-        joiner = WifiJoiner(context, diagnostic = ::log, maySubmitRequest = {
-            wifiJoiner === joiner && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt))
-        }) {
-            scope.launch {
-                autoConnectChanges.lock()
-                try {
-                    if (wifiJoiner !== joiner || joiner.release() != null) return@launch
-                    if (wifiRecoveryLease.isRetained(joiner)) {
-                        releaseRetainedWifi()
-                        log("WIFI-LEASE: 待机中的局域网请求已丢失，释放旧租约")
-                    } else if (sessionLive.get()) {
-                        log("WIFI: 本轮局域网请求已丢失；回调本身不判定热点关闭或断链发起方")
-                        disconnect(userInitiated = false, expectedAttempt = connectionAttemptId, reason = "车机局域网请求丢失")
-                    }
-                } finally { autoConnectChanges.unlock() }
-            }
+        val joiner = createWifiJoiner(context) {
+            wifiJoiner === it && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt))
         }
         autoConnectChanges.lock()
         try { ensureCurrent(); wifiJoiner = joiner } finally { autoConnectChanges.unlock() }
@@ -2501,7 +2629,8 @@ object HyperCarRepo {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             ensureCurrent()
             if (wifiJoiner !== joiner) throw CancellationException("网络租约已更换")
-            if (effective == null || cm.getNetworkCapabilities(effective)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true ||
+            val capabilities = effective?.let(cm::getNetworkCapabilities)
+            if (effective == null || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true ||
                 !joiner.bindProcess(effective, verifiedSystemHotspot = effective == matchingAfterScan)) {
                 val association = joiner.release()
                 if (association != null) {
@@ -2516,9 +2645,106 @@ object HyperCarRepo {
             joinedSsid = ssid
             joinedNetwork = effective
             watchSessionNetwork(context, effective)
+            val hotspot = currentBluetoothHotspot(attempt)
+            if (ssid != null && psk != null && hotspot != null && CarHotspotReconnect.canRemember(
+                    psk, freshHotspot = endpoint.canRequestHotspot(hotspot),
+                    ownedRequest = joiner.ownsHotspot(effective, ssid, psk),
+                    localOnly = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                    desktop = isDesktopHotspotPeer(headUnitProfile.id, hotspot.peer),
+                )) {
+                pendingCarHotspot.set(PendingCarHotspot(attempt, hotspot.peer, effective, CarHotspotReconnect.Credentials(ssid, psk)))
+            }
             log("WIFI +${stageMs()}ms ✓ 已绑定车机网络：${describeNetwork(context, effective)}")
             return effective
         } finally { autoConnectChanges.unlock() }
+    }
+
+    private fun createWifiJoiner(context: Context, maySubmitRequest: (WifiJoiner) -> Boolean): WifiJoiner {
+        lateinit var joiner: WifiJoiner
+        joiner = WifiJoiner(context, diagnostic = ::log, maySubmitRequest = { maySubmitRequest(joiner) }) {
+            scope.launch {
+                autoConnectChanges.lock()
+                try {
+                    if (wifiJoiner !== joiner) return@launch
+                    val provisional = hotspotHandoff.provisionalNetwork
+                    if (provisional != null && releaseLostProvisionalHotspot(context, provisional, joiner)) return@launch
+                    if (joiner.release() != null) return@launch
+                    if (wifiRecoveryLease.isRetained(joiner)) {
+                        releaseRetainedWifi()
+                        log("WIFI-LEASE: 待机中的局域网请求已丢失，释放旧租约")
+                    } else if (sessionLive.get()) {
+                        log("WIFI: 本轮局域网请求已丢失；回调本身不判定热点关闭或断链发起方")
+                        disconnect(userInitiated = false, expectedAttempt = connectionAttemptId, reason = "车机局域网请求丢失")
+                    }
+                } finally { autoConnectChanges.unlock() }
+            }
+        }
+        return joiner
+    }
+
+    private suspend fun restoreCarHotspot(
+        context: Context,
+        receiver: String,
+        credentials: CarHotspotReconnect.Credentials,
+        advertiser: CarPlayCtrlAdvertiser,
+        mayRestore: () -> Boolean,
+    ) {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        val joiner = createWifiJoiner(context) { hotspotHandoff.isJoining(it) && mayRestore() }
+        val reserved = autoConnectChanges.withLock {
+            synchronized(ctrlNetworkLock) {
+                synchronized(advertiser) {
+                    if (!mayRestore() || !hotspotHandoff.begin(joiner, receiver)) return@withLock false
+                    if (boundNetwork != null) {
+                        clearSessionWifiBinding(context)
+                        log("CAR-WIFI-RESUME: 结束普通 Wi-Fi 上的临时广播，尝试已配对热点")
+                    }
+                    true
+                }
+            }
+        }
+        if (!reserved) return
+        try {
+            log("CAR-WIFI-RESUME: 尝试重新接入已配对车机的专用 Wi-Fi")
+            val result = withTimeoutOrNull(12_000) {
+                joiner.joinCarHotspotSilently(credentials.ssid, credentials.passphrase)
+            }
+            val network = (result as? WifiJoiner.JoinResult.Joined)?.network
+            if (network == null) {
+                log("CAR-WIFI-RESUME: 未取得车机 Wi-Fi，继续等待本轮蓝牙参数或车机邀请")
+                return
+            }
+            autoConnectChanges.lock()
+            try {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!mayRestore() || !joiner.ownsHotspot(network, credentials.ssid, credentials.passphrase) ||
+                    cm.getNetworkCapabilities(network)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) != false ||
+                    !joiner.bindProcess(network)) return
+                hotspotHandoff.bind(joiner, network)
+                wifiJoiner = joiner
+                wifiReceiverMac = receiver
+                CarProfileGuard.noteCar(receiver)
+                sessionWifiSsid = credentials.ssid
+                boundNetwork = network
+                joinedSsid = credentials.ssid
+                joinedNetwork = network
+                watchSessionNetwork(context, network)
+                advertiser.ensureForNetwork(credentials.ssid, network = network)
+                log("CAR-WIFI-RESUME: 已接入专用 Wi-Fi 并开始等待车机邀请")
+            } finally { autoConnectChanges.unlock() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            log("CAR-WIFI-RESUME: 入网异常（${error.javaClass.simpleName}），继续等待车机")
+        } finally {
+            if (hotspotHandoff.isJoining(joiner)) {
+                try {
+                    joiner.release(keepConnected = false)
+                } finally {
+                    hotspotHandoff.finishJoining(joiner)
+                }
+            }
+        }
     }
 
     /** Live network diagnostics; no saved credentials. */
@@ -2552,7 +2778,7 @@ object HyperCarRepo {
         context: Context,
         seen: CarPlayEndpoint?,
     ): CarPlayEndpoint? {
-        if (headUnitProfile.requireAirplayActivation) return null
+        if (headUnitProfile.requireAirplayActivation || hotspotHandoff.discoveryToken() == null) return null
         val gateway = wifiGateway(context) ?: return null
         log(
             "SESSION: 车机未给可用 AirPlay 地址" +
@@ -2865,14 +3091,28 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
 
-    /** 按 MAC 查已配对蓝牙设备的名称（缺 BLUETOOTH_CONNECT 时返回 null）。 */
+    /** 按蓝牙 MAC 核对系统配对，缺 BLUETOOTH_CONNECT 时返回 null。 */
     @android.annotation.SuppressLint("MissingPermission")
-    private fun bondedNameOf(mac: String): String? = runCatching {
+    private fun bondedDeviceOf(mac: String): BluetoothDevice? = runCatching {
         android.bluetooth.BluetoothAdapter.getDefaultAdapter()
             ?.bondedDevices
             ?.firstOrNull { it.address.equals(mac, ignoreCase = true) }
-            ?.name
     }.getOrNull()
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun bondedNameOf(mac: String): String? = runCatching { bondedDeviceOf(mac)?.name }.getOrNull()
+
+    private fun isDesktopHotspotPeer(profileId: String, mac: String): Boolean {
+        val peer = io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(mac) ?: bondedNameOf(mac)
+        return io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(profileId, peer)
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun canRestoreCarHotspot(context: Context, profileId: String, receiver: String): Boolean {
+        val paired = SettingsStore.isCarPaired(receiver) && PairingEvidence.read(context.filesDir, receiver).mayDropProfiles
+        return CarHotspotReconnect.canRestore(manual = true, target = receiver, bonded = bondedDeviceOf(receiver)?.address,
+            paired = paired, desktop = isDesktopHotspotPeer(profileId, receiver))
+    }
     /**
      * 配对身份自愈：**文件是主、SharedPreferences 是备份**。
      *
@@ -2998,6 +3238,10 @@ object HyperCarRepo {
     private var lastAudioPlaying = false
     private val closedPipelineGeneration = java.util.concurrent.atomic.AtomicLong(0)
 
+    /** 车机 Wi-Fi 掉线时刻：窗口内的断开视为抖动，保活车机界面并立即重连。 */
+    private val lastWifiFlapElapsed = AtomicLong(0)
+    private const val WIFI_FLAP_WINDOW_MILLIS = 6_000L
+
     private val rustListener = object : RustCoreBridge.EventListener {
         private var activationGeneration = 0L
         private var activationKey = ""
@@ -3068,17 +3312,22 @@ object HyperCarRepo {
                 }
                 "negotiating" -> {
                     SettingsStore.receiverViewport = null
+                    SettingsStore.receiverMaxFps = null
                     io.github.hypercar.carui.CarDisplayLayout.state.value = null
+                    io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
                     push(link = LinkState.Negotiating(detail))
                 }
                 "connected" -> {
+                    synchronized(targetCarChanges) {
+                        if (!cachedHotspotMatchesTarget()) return
+                        sessionHadLink = true
+                    }
                     sessionIdentity?.let { ensurePairingIdentity(it) }
                     val diagnosticId = connectionAttemptId
                     connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.CONTROL_READY)
                     connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                     MusicBridge.onCarConnected(callbackOwner)
                     streaming = true
-                    sessionHadLink = true
                     // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
                     // 蓝牙已配对 ≠ CarPlay 配对过：只有会话真正激活（RECORD 完成）才算。
                     runCatching {
@@ -3097,6 +3346,21 @@ object HyperCarRepo {
                                 bondedNameOf(mac),
                             )
                             SettingsStore.markCarPaired(mac, carName)
+                            val candidate = pendingCarHotspot.getAndSet(null)
+                            val context = appContext()
+                            if (context != null && candidate != null && candidate.attempt == diagnosticId &&
+                                candidate.network == sessionSockets?.network && candidate.receiver.equals(mac, true)) {
+                                scope.launch {
+                                    autoConnectChanges.lock()
+                                    try {
+                                        if (connectionAttemptId == candidate.attempt && SettingsStore.isCarPaired(mac) &&
+                                            PairingEvidence.read(context.filesDir, mac).mayDropProfiles) {
+                                            runCatching { CarHotspotReconnect.save(context, mac, candidate.credentials) }
+                                                .onFailure { log("CAR-WIFI-RESUME: 缓存保存失败（${it.javaClass.simpleName}）") }
+                                        }
+                                    } finally { autoConnectChanges.unlock() }
+                                }
+                            }
                             val rememberedSsid = sessionWifiSsid ?: joinedSsid
                             if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
                             val from = when {
@@ -3173,7 +3437,7 @@ object HyperCarRepo {
             scope.launch {
                 val ctx = appContext() ?: return@launch
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
-                val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
+                val reason = if (startup) "源端 CMD 持续拒绝连接" else "收到车机显示尺寸或帧率声明"
                 log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
                 log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
             }
@@ -3183,7 +3447,8 @@ object HyperCarRepo {
             io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
         }
 
-        override fun onDisplaySize(width: Int, height: Int) {
+        override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
+            SettingsStore.receiverMaxFps = maxFps.takeIf { it > 0 }
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
             if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
                 // receiverForEngine froze the actual peer for this AirPlay session.
@@ -3193,18 +3458,32 @@ object HyperCarRepo {
             }
         }
 
+        override fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {
+            io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value =
+                if (sessionLive.get() && !sessionCarWithMode && targets.isNotEmpty())
+                    io.github.hypercar.carui.CarDisplayLayout.ViewAreaChoices(revision, uuid, targets.toList())
+                else null
+        }
+
         override fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
-                                     safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {
+                                     safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean,
+                                     statusBarEdge: Int, rightHandDrive: Boolean, allowsFocus: Boolean) {
+            if (!sessionCarWithMode) io.github.hypercar.carui.CarReceiverUi.setFocusTransferAllowed(allowsFocus)
             io.github.hypercar.carui.CarDisplayLayout.state.value = io.github.hypercar.carui.DisplayLayout(
                 width, height,
                 io.github.hypercar.carui.DisplayRect(viewX, viewY, viewWidth, viewHeight),
                 io.github.hypercar.carui.DisplayRect(safeX, safeY, safeWidth, safeHeight), drawOutside,
+                io.github.hypercar.carui.CarDockEdge.fromReceiver(statusBarEdge, rightHandDrive),
             )
         }
 
         override fun onNightMode(night: Boolean) {
             io.github.hypercar.carui.CarUiSettings.onCarNight(night)
             log("CARUI: 车机日夜模式 night=$night")
+        }
+
+        override fun onReceiverUi(kind: String, payload: String) {
+            if (!sessionCarWithMode) io.github.hypercar.carui.CarReceiverUi.handle(kind, payload)
         }
 
         override fun onMediaKey(usage: Int) {
@@ -3352,10 +3631,10 @@ object HyperCarRepo {
         advertiser: CarPlayCtrlAdvertiser,
         invitationOnly: Boolean,
         usesFallbackPhoneIdentity: Boolean,
+        cachedWifiReceiver: String?,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
         val diagnosticId = connectionAttemptId
-        // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
-        // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
+        // A provisional hotspot can carry a new invitation but cannot activate AirPlay on its own.
         val profileRequiresActivation = headUnitProfile.requireAirplayActivation
         prepareInvitationNetwork(context, advertiser)
         val requireActivation = invitationOnly || profileRequiresActivation
@@ -3369,7 +3648,7 @@ object HyperCarRepo {
                 push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
             }
         }
-        if (!requireActivation) {
+        if (!requireActivation && hotspotHandoff.discoveryToken() != null) {
             val remembered = probeRememberedEndpoint(context, coordinator)
             if (remembered != null && advertiser.lastInvitePeerIp == null) {
                 awaitingCarInvitation = false
@@ -3390,8 +3669,49 @@ object HyperCarRepo {
             // 端口阶段（awaitUsableEndpoint 已返回）再来的 0x4301：记下来供端口循环热切换
             recordLateAirplayEndpoint(coordinator, diagnosticId, endpoint)
         }
+        val cachedCredentials = cachedWifiReceiver?.let { receiver ->
+            val credentials = runCatching { CarHotspotReconnect.load(context, receiver) }
+                .onFailure { log("CAR-WIFI-RESUME: 缓存读取失败（${it.javaClass.simpleName}）") }.getOrNull()
+            if (credentials == null) log("CAR-WIFI-RESUME: 尚无已验证的热点缓存，继续等待车机")
+            credentials
+        }
+        fun hasFreshCredentials(endpoint: CarPlayEndpoint?): Boolean = endpoint != null &&
+            endpoint.canRequestHotspot(currentBluetoothHotspot(diagnosticId)) &&
+            WifiJoiner.canRequestHotspot(endpoint.ssid, endpoint.passphrase)
+
+        fun endpointWifiReady(freshCredentials: Boolean): Boolean = CarHotspotReconnect.canUseEndpoint(
+            hasCache = cachedCredentials != null,
+            carNetworkReady = boundNetwork?.let { it != unverifiedInvitationNetwork } == true,
+            freshCredentials = freshCredentials,
+        )
+
+        suspend fun acceptIap2Endpoint(endpoint: CarPlayEndpoint): Boolean {
+            if (headUnitProfile.requireFreshCtrlInvite || pickHost(endpoint) == null) return false
+            return autoConnectChanges.withLock {
+                if (!cachedHotspotMatchesTarget() || !endpointWifiReady(freshCredentials = false)) return@withLock false
+                boundNetwork?.let(hotspotHandoff::confirm)
+                true
+            }
+        }
+
+        val cachedWifiJob = if (cachedWifiReceiver != null && cachedCredentials != null) {
+            val profileId = headUnitProfile.id
+            launch {
+                delay(2_000) // Give the live Bluetooth handoff the first opportunity.
+                fun mayRestore() = sessionLive.get() && connectionAttemptId == diagnosticId && !userDisconnectRequested &&
+                    headUnitProfile.id == profileId && SettingsStore.targetCarMac.equals(cachedWifiReceiver, true) &&
+                    (coordinator.activePeerAddress?.equals(cachedWifiReceiver, true) != false) && ctrlAdvertiser === advertiser &&
+                    CarHotspotReconnect.canReplaceBinding(
+                        boundNetwork, unverifiedInvitationNetwork, joinedSsid, cachedCredentials.ssid,
+                    ) &&
+                    wifiJoiner == null && !hasFreshCredentials(joinHints.get()) && !hasFreshCredentials(standbyEndpoint.get()) &&
+                    !advertiser.hasUnresolvedOrPublishedInvite && canRestoreCarHotspot(context, profileId, cachedWifiReceiver)
+                if (mayRestore()) restoreCarHotspot(context, cachedWifiReceiver, cachedCredentials, advertiser, ::mayRestore)
+            }
+        } else null
         try {
             var usable: CarPlayEndpoint? = null
+            var awaitingWifi: CarPlayEndpoint? = null
             var ticks = 0
             var partialKey: String? = null
             var advertisedSsid: String? = null
@@ -3407,8 +3727,10 @@ object HyperCarRepo {
                 if (boundNetwork != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WIFI_BOUND)
                 val next = standbyEndpoint.getAndSet(null)
                     ?: withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
-                if (next != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
-                    "wifiCredentials=${!next.ssid.isNullOrBlank()} endpoint=${next.ipAddresses.isNotEmpty()}")
+                if (next != null) {
+                    connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
+                        "wifiCredentials=${!next.ssid.isNullOrBlank()} endpoint=${next.ipAddresses.isNotEmpty()}")
+                }
                 if (next == null) {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
@@ -3417,7 +3739,9 @@ object HyperCarRepo {
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
                     //    到达，TCP 对端地址就是车机在热点网段上的地址，AirPlay 控制面在 7000。
-                    val inviteIp = usableCtrlInvitation(advertiser)?.host
+                    val inviteIp = autoConnectChanges.withLock {
+                        usableCtrlInvitation(advertiser)?.also { hotspotHandoff.confirm(it.network) }?.host
+                    }
                     if (inviteIp != null) {
                         val base = lastSeen.get()
                         log("SESSION: ✓ 车机已邀请（$inviteIp）——用它当 AirPlay 端点 :7000")
@@ -3434,10 +3758,16 @@ object HyperCarRepo {
                         )
                         continue
                     }
+                    val deferred = awaitingWifi
+                    if (deferred != null && !hasFreshCredentials(joinHints.get()) && acceptIap2Endpoint(deferred)) {
+                        usable = deferred
+                        continue
+                    }
                     // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
                     //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
-                    val ssid = currentWifiSsid(context)
-                    if (!requireActivation && !ssid.isNullOrBlank() && ssid !in probedSsid) {
+                    val ssid = if (!requireActivation && cachedWifiJob?.isActive != true &&
+                        hotspotHandoff.discoveryToken() != null) currentWifiSsid(context) else null
+                    if (!ssid.isNullOrBlank() && ssid !in probedSsid) {
                         val changed = observedSsid != null && observedSsid != ssid
                         val isCarHotspot = ssid == lastSeen.get()?.ssid || knownWifiReceiver(ssid) != null
                         if (changed || isCarHotspot) {
@@ -3555,6 +3885,16 @@ object HyperCarRepo {
                 }
                 val merged = mergeEndpoint(lastSeen.get(), next)
                 lastSeen.set(merged)
+                val freshCredentials = cachedWifiJob != null && hasFreshCredentials(merged)
+                if (freshCredentials) cachedWifiJob?.cancelAndJoin()
+                if (!endpointWifiReady(freshCredentials)) {
+                    if (awaitingWifi == null && pickHost(merged) != null) {
+                        log("CAR-WIFI-RESUME: 已收到 AirPlay 地址，等待车机 Wi-Fi 或本轮热点凭据")
+                    }
+                    awaitingWifi = merged
+                    continue
+                }
+                awaitingWifi = null
                 // 0x5703 只给 ssid/psk：先入网 + 广播，车机才可能邀请并下发 0x4301
                 if (!merged.ssid.isNullOrBlank() && merged.ssid != advertisedSsid) {
                     log("SESSION: 已收到车机热点参数——先核实入网，再广播 _carplay-ctrl")
@@ -3607,7 +3947,7 @@ object HyperCarRepo {
                 }
                 // Only fresh coordinator callbacks reach here; cached/scanned endpoints
                 // are gated separately during fallback. A fresh 0x4301 is also a receiver invitation.
-                if (!headUnitProfile.requireFreshCtrlInvite && pickHost(merged) != null) {
+                if (acceptIap2Endpoint(merged)) {
                     usable = merged
                     continue
                 }
@@ -3626,6 +3966,7 @@ object HyperCarRepo {
             awaitingCarInvitation = false
             usable
         } finally {
+            cachedWifiJob?.cancel()
             densoProbe?.cancel()
             callbacks.close()
         }
@@ -3948,6 +4289,7 @@ object HyperCarRepo {
      */
     fun exportLogs() {
         scope.launch {
+            mediaLog.flush()
             val logs = withContext(Dispatchers.IO) {
                 synchronized(diskLogLock) {
                     val history = runCatching {
@@ -4080,9 +4422,6 @@ object HyperCarRepo {
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
-
-    /** 弱信号短时衰落（地库/隧道重关联）的观察宽限；期内网络重绑则保留本轮会话。 */
-    private const val NETWORK_LOST_GRACE_MS = 4_000L
 
     /** 掉线自动重连：退避序列（ms）与最大连续尝试次数。 */
 

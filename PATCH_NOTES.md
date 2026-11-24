@@ -1,85 +1,35 @@
-# HyperCar 0.1.0.614 七轮补丁说明（debug 出包）
+# HyperCar 本地补丁说明（八轮 · 基于上游 v0.1.0.618）
 
-基线：上游 tag `v0.1.0.614`（versionCode 10710），保留 614 全部新功能（短视频 App
-投影、投影选择器、投影时暂停本地音乐等）。本机无工具链，由 Actions `debug-build.yml`
-云端编译，编译错误以 CI 日志为准。
+基线：`fw867/hypercar` 标签 `v0.1.0.618`（versionName 0.1.0.618，上游 versionCode 10714）。
+本包 `versionCode=10716`，仅含以下针对现场问题的改动。
 
-## 相对上游 614 的改动
+## 1. 会话抖动保活（修「连上就闪退 / 无法保持」）
+现场日志 `hypercar-log-20261124-065545` 的直接触发链：车机 Wi-Fi（network #1811）
+掉线 → 事件通道 socket 被中止（os error 103）→ 会话判结束 → 首页虚显/编码器释放 →
+`CarHomeActivity` 被 finish（手机端表现为退出，车机黑屏约 8s 才恢复画面）。
 
-### 锁屏无感化（消除车机“跟着锁一下再恢复”）
+改动（`session/HyperCarRepo.kt` + `carui/CarUiCaster.kt`）：
+- 新增 `lastWifiFlapElapsed`：`onLost` 记录掉线时刻，6s 窗口内的断开判定为「抖动」。
+- 抖动时调用 `runDisconnect(reason, flap=true)`：仍结束传输会话，但
+  **不拆除首页虚显与编码器**（`CarUiCaster.holdForReconnect`），并强制 `keepListening`
+  保持前台服务与监听存活。
+- 保活窗口 20s；期间 `stopAsync()` 自动跳过拆除，超时才真正释放（`stopAsync(force=true)`）。
+- 重连成功后 `CarUiCaster.start()` 命中既有「已经在跑」分支，直接复用同一块虚显与编码器，
+  只重新上报画面尺寸（触摸坐标不再按 2560x744 缩放），车机无需重新建屏。
+- 重连退避：抖动场景首个重试延迟压到 ≤800ms（原 2000ms）。
 
-五轮日志显示：收到 `SCREEN_OFF` 后，代码立即 `stopLocked()` + `startLocked()`，
-把旧源虚拟屏 2615 和编码器释放后新建 2617，车机可见的瞬间闪断正来自这次整源重建。
+## 2. 音频采集缓冲与诊断（沿用七轮）
+`spike/ShellPlaybackAudio.kt`：REMOTE_SUBMIX 采集缓冲 38400 → 153600（约 800ms），
+新增 `shortReads` / `totalKB` 统计并打入 CARUI-AUDIO 五行日志。
 
-- `carui/CarUiCaster.kt`：`SCREEN_OFF` / 锁屏瞬间**不再主动重建源屏**，保留现有
-  虚拟屏、编码器和首页任务；只有 display 被移除、shell 服务断开或看门狗判定真的
-  帧停滞/断线时才恢复。
-- `spike/SpikeShellService.kt`：建屏每个候选 flag 的 null/异常都写入 `SHELL` 报告，
-  便于确认 HarmonyOS 拒绝 `OWN_DISPLAY_GROUP` / `ALWAYS_UNLOCKED` 的具体原因。
+## 3. 音频节奏恢复放宽 + 统计回绕修正
+- `rust-core/src/audio_pacing.rs`：`recoverable_source_frames` 由「1 块、queued≥704」
+  放宽为「最多 2 块、晚 <3 slot、queued≥1056」，容忍 worker 一次短停顿。
+- `rust-core/src/engine.rs`：`skipped = missed - recovered` 改
+  `missed.saturating_sub(recovered)`，修复日志里
+  `skipped_source_frames=18446744073709551264` 的 u64 下溢（放大恢复窗口后必然触发）。
 
-### 自定义 App 横屏适配与诊断
-
-五轮已把展开态画布改为横屏；日志确认虚显本身已是 `2495x794 dpi=211`，但任务窗口
-bounds / freeform 模式未成功，且 Android 12 不认识五轮传入的兼容 ChangeId。
-
-- `spike/MapCompat.kt`：方向兼容命令同时尝试 ChangeId 与名称别名
-  （`OVERRIDE_UNDEFINED_ORIENTATION_TO_NOSENSOR`、`OVERRIDE_ANY_ORIENTATION`），
-  两条命令的 exit / out / err 都完整写入日志。
-- `carui/MediaTaskWindow.kt`：expand 过程逐段记录 freeform、resize、get-mode 结果；
-  任务找不到或 bounds 未匹配时导出 `am stack list` 相关 RootTask / 任务行，便于判断
-  是 freeform 不支持、任务仍被锁竖屏，还是 resize 未生效。
-
-### 线程提级（操作其他 App 时音视频卡顿）
-
-三轮只覆盖了 JVM 采集/编码器线程；四轮把 Rust/native 与剩余转码线程也提级。
-
-- `rust-core/src/thread_prio.rs`：新增 native nice 档位工具，失败只记日志不崩。
-- `rust-core/src/lib.rs`：tokio 4 个核心工作线程启动时提至 nice=-4（DISPLAY）。
-- `rust-core/src/engine.rs`：独立混音线程 `hypercar-audio` 提至 nice=-16（URGENT_AUDIO）。
-- `rust-core/src/audio_out/aac_worker.rs`：AAC 编码线程提至 nice=-16。
-- `core/CarWithHevcTranscoder.kt`：初始化、解码、编码线程提至 `THREAD_PRIORITY_DISPLAY`。
-- `core/CodecSurfaceBridge.kt`：EGL/渲染 HandlerThread 提至 `THREAD_PRIORITY_DISPLAY`。
-- 三轮保留：`CarAudioCapture.kt`、`ShellPlaybackAudio.kt`、`SplitPlaybackAudio.kt`
-  读取线程紧急音频优先级；`SpikeCaster.kt` 编码器 HandlerThread 显示优先级。
-
-### 音频采集稳健性
-- `ShellPlaybackAudio.kt`：采集缓冲 38400 → 76800 字节（200ms）；短读块补零后按完整帧写出。
-- `SplitPlaybackAudio.kt`：短读块补零、按完整缓冲写出。
-
-### 七轮：展开态回收保护与音频短时欠载容忍
-
-- `carui/MediaCardProjection.kt`：展开面板收到旧卡片迟到的 `show(false)` 时不再释放横屏任务、重建竖屏虚显；新增 show 入口诊断，记录视图尺寸、横屏状态、texture 身份和现有附件状态。
-- `carui/CarHomeScreen.kt`：`AndroidView.update` 中刷新 SurfaceTextureListener，面板复用 View 时避免旧闭包仍按卡片态回调。
-- `spike/ShellPlaybackAudio.kt`：REMOTE_SUBMIX 采集缓冲提到约 800ms，记录实际 AudioRecord 缓冲、短读次数和欠载字节；URGENT_AUDIO 提级失败写入日志。
-- `spike/SplitPlaybackAudio.kt`：两条策略音频通道分别累计短读次数与欠载字节。
-- `rust-core/src/audio_pacing.rs`：短时 worker 调度延迟时保留最多两个就绪 PCM 块，避免一次唤醒延后就直接过期成静音。
-
-### 弱信号宽限
-- `session/HyperCarRepo.kt`：`onLost` 增加 4000ms 宽限期；期内网络重绑则保留会话，
-  超时未恢复再断开。
-
-## 出包方式
-
-- `.github/workflows/debug-build.yml`：JDK17 + Rust aarch64-linux-android + NDK r27c +
-  cargo-ndk 编译核心层，`:app:assembleDebug`，产物 `HyperCar-0.1.0.614-debug.apk`。
-- 移除官方 `android-ci.yml`（缺签名 Secret 会直接失败）。
-- `versionCode` 10710 → 10715；`versionName` 保持 0.1.0.614。
-- debug 证书签名：安装前必须先卸载官方签名版本。
-
-## 日志判断要点
-
-- 六轮 `CARUI-LIFECYCLE` 息屏行应是“保留现有源屏与编码器，不主动重建”，不应再出现
-  锁屏瞬间 `recovery rebuilding source`。
-- `VIDEO-CARD` 新增 `expand freeform-mode` / `expand resize` / `expand final` /
-  `stack:` 行；回传日志时重点看任务 bounds 是否仍是竖屏、freeform 模式是否可用。
-- 新增 `THREAD-PRIO:` 行：记录各 native/JVM 线程 tid 与 nice；若 `setpriority` 失败，
-  会带错误原因，现场回传时重点看。
-- 仍看 `AUDIO-PACING` 的 `max_late_us` / `expired_media_frames`、`SPIKE` 的 fps 与 gap。
-
-## 未覆盖 / 待观察
-
-- 若目标 App 在 Manifest 中硬锁竖屏、且 Android 12/HarmonyOS 不提供方向兼容覆盖，
-  系统会按 letterbox 保留竖条；App 侧无法绕过系统窗口策略。需用六轮 stack 日志确认。
-- ownGroup/alwaysUnlocked 被系统拒绝的具体权限原因仍需 SHELL 段日志确认。
-- 地库/隧道断连需实地复测并回传日志。
-- 手机侧设置（代码不可强制）：电池优化白名单、最近任务锁卡片、允许后台活动/自启动。
+## 4. 未采用的方案
+- 自定义 App 软件横屏：HarmonyOS user build 拒绝方向兼容覆盖，收益为零（用户已放弃）。
+- FFmpeg 软编整体替换：Surface 无法直接喂 FFmpeg，需 ImageReader/EGL + x264(GPL)，
+  前台抢占下更易卡，不推荐。

@@ -89,7 +89,7 @@ jobs:
       - name: 校验产物并打包
         id: package
         env:
-          VERSION: 0.1.0.614
+          VERSION: 0.1.0.618
         run: |
           set -eu
           APK=app/build/outputs/apk/debug/app-debug.apk
@@ -118,7 +118,7 @@ jobs:
 
       - name: 写入运行摘要
         env:
-          VERSION: 0.1.0.614
+          VERSION: 0.1.0.618
           NAME: ${{ steps.package.outputs.name }}
           SHA: ${{ steps.package.outputs.sha }}
           SIZE: ${{ steps.package.outputs.size }}

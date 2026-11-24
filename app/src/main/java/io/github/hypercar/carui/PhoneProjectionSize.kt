@@ -13,11 +13,9 @@ internal data class PhoneProjectionSize(val width: Int, val height: Int, val dpi
     }
 
     fun expanded(width: Int, height: Int): PhoneProjectionSize {
-        // 车机联屏是横屏：展开态强制横向画布，避免竖屏手机尺寸的虚显被塞进横屏面板。
-        val landscapeW = maxOf(width, height)
-        val landscapeH = minOf(width, height)
-        val tabletDpi = (minOf(landscapeW, landscapeH) * 160 / 600).coerceAtLeast(120)
-        return PhoneProjectionSize(landscapeW, landscapeH, minOf(dpi, tabletDpi))
+        // Offer a tablet-sized window using the actual CarPlay canvas, without stretching a phone buffer.
+        val tabletDpi = (minOf(width, height) * 160 / 600).coerceAtLeast(120)
+        return PhoneProjectionSize(width, height, minOf(dpi, tabletDpi))
     }
 
     companion object {

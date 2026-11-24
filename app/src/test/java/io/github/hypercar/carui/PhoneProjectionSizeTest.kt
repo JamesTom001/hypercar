@@ -16,6 +16,6 @@ class PhoneProjectionSizeTest {
 
     @Test fun expandedDisplayMatchesItsCanvasAndExposesTabletWidth() {
         assertEquals(PhoneProjectionSize(2200, 800, 213), phone.expanded(2200, 800))
-        assertEquals(PhoneProjectionSize(1000, 600, 160), phone.expanded(600, 1000))
+        assertEquals(PhoneProjectionSize(600, 1000, 160), phone.expanded(600, 1000))
     }
 }

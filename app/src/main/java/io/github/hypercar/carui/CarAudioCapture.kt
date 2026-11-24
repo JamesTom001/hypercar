@@ -87,7 +87,6 @@ object CarAudioCapture {
     }
 
     private fun read(current: Pump, lane: Int, descriptor: ParcelFileDescriptor) {
-        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) }
         var samples = 0L
         var peak = 0
         var squareSum = 0.0

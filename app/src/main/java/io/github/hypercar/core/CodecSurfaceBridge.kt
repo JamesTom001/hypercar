@@ -101,7 +101,7 @@ internal class CodecSurfaceBridge(output: Surface, private val sw: Int, private 
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE)
-            thread=HandlerThread(if (projectionFailure == null) "CarWithCodecSurface" else "MapVideoSurface", android.os.Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
+            thread=HandlerThread(if (projectionFailure == null) "CarWithCodecSurface" else "MapVideoSurface").also { it.start() }
             worker = Handler(checkNotNull(thread).looper)
             texture=SurfaceTexture(textureId).also { tex -> tex.setDefaultBufferSize(sw,sh)
                 tex.setOnFrameAvailableListener({

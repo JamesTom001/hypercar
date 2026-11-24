@@ -30,8 +30,11 @@ use crate::{emit_log, emit_stats, emit_state};
 pub enum SourceEvent {
     CarWithTouch(TouchInput),
     RequestCarWithKeyFrame,
+    EncoderFrameRate(u32),
     ResetVideoSource,
+    VideoBacklogDropped { frames: usize, bytes: usize, oldest_ms: u64 },
     RequestHostUi,
+    RequestViewArea(crate::display_layout::ViewRequest),
     CancelSelfAsr(u64),
     RequestAudioOwnership(PlaybackIntent, std::time::Instant),
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
@@ -82,6 +85,8 @@ pub struct EngineConfig {
     pub carwith_microphone: bool,
     #[serde(default)]
     pub keep_alive_stats: bool,
+    #[serde(default)]
+    pub request_receiver_stats: bool,
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
     #[serde(default)]
@@ -181,14 +186,17 @@ pub async fn run_engine(
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
     let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+    pipeline.lock().video_requested_fps = cfg.carwith_fps();
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
     let _ = (&touch_tx, &key_tx);
 
     // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
+    let (view_tx, view_rx) = mpsc::channel::<crate::display_layout::ViewRequest>(1);
     let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(PlaybackIntent, std::time::Instant)>(4);
-    let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
+    let (video_tx, video_rx) = crate::video_queue::channel();
+    let video_queue_observer = video_rx.observer();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let fallback_audio_tx=audio_tx.clone();
     let auxiliary_input=Arc::new(crate::aux_audio::Input::default());
@@ -242,6 +250,7 @@ pub async fn run_engine(
                             CarLifeEvent::VideoFrameTagged { pts_us, data, codec } => {
                                 let _=vtx.send(SourceEvent::VideoFrameTagged {pts_us,data,codec,origin});
                             }
+                            CarLifeEvent::EncoderFrameRate(fps) => { let _ = vtx.send(SourceEvent::EncoderFrameRate(fps)); }
                             CarLifeEvent::EncoderResolution { width, height } => {
                                 *carwith_touch_size.lock() = (width, height);
                                 let _ = vtx.send(SourceEvent::EncoderResolution { width, height });
@@ -323,6 +332,7 @@ pub async fn run_engine(
                             if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
+                        Some(SourceEvent::RequestViewArea(request)) => { let _ = view_tx.try_send(request); }
                         Some(SourceEvent::RequestAudioOwnership(intent, at)) => {
                             if let Err(error) = claims.try_send((intent, at)) {
                                 emit_log(&format!("AUDIO-RESOURCE: claim user=true queue rejected: {error}"));
@@ -372,12 +382,22 @@ pub async fn run_engine(
         let health=pipeline.clone(); let vs=video_stats.clone(); let aus=audio_stats.clone(); let signal=stop.clone();
         tasks.spawn(async move {
             let mut last_key=String::new();
+            let mut last_video_sample = None;
             let mut last_audio_bytes=0u64;
             let mut last_audio_tick=tokio::time::Instant::now();
             let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
             loop {
-                let mut snapshot=health.lock().snapshot();
+                let (mut snapshot, queue_report) = {
+                    let mut health = health.lock();
+                    let report = video_queue_observer.report(health.video_tcp.as_ref().map(|tcp| tcp.connection_id));
+                    (health.snapshot(), report)
+                };
                 { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
+                let now = tokio::time::Instant::now();
+                if let Some((then, previous)) = last_video_sample.replace((now, snapshot.video_frames_written)) {
+                    snapshot.video_actual_fps = Some(snapshot.video_frames_written.saturating_sub(previous) as f64 /
+                        now.duration_since(then).as_secs_f64().max(0.001));
+                }
                 {
                     let a=aus.lock();
                     snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets;
@@ -388,6 +408,7 @@ pub async fn run_engine(
                 }
                 snapshot.wifi_iap2=crate::wifi_iap2::phase(snapshot.wifi_id);
                 let now_ms=crate::timing::monotonic_nanos()/1_000_000;
+                if let Some(report) = queue_report { report.log(snapshot.generation, now_ms); }
                 snapshot.timing.refresh_age(now_ms);
                 if let Some(tcp)=snapshot.video_tcp.as_mut() {tcp.age_ms=now_ms.saturating_sub(tcp.sampled_ms);}
                 if let Ok(json)=serde_json::to_string(&snapshot) { crate::emit_pipeline(&json); }
@@ -420,6 +441,7 @@ pub async fn run_engine(
         bmw_capabilities: cfg.bmw_capabilities,
         microphone_probe,
         keep_alive_stats: cfg.keep_alive_stats,
+        request_receiver_stats: cfg.request_receiver_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         head_unit_profile: cfg.head_unit_profile.clone(),
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
@@ -465,7 +487,7 @@ pub async fn run_engine(
         factory,
         touch_tx,
         key_tx,
-        stop.clone(),
+        shutdown.clone(),
         screen_ready_tx,
         &mut pending_cleanup,
         receiver_audio_generation.clone(),
@@ -511,6 +533,14 @@ pub async fn run_engine(
         }
     });
     let control = outcome.control;
+    let view_control = control.clone();
+    let view_stop = stop.clone();
+    tasks.spawn(async move {
+        tokio::select! {
+            _ = view_stop.notified() => {}
+            _ = crate::display_layout::send_requests(view_control, view_rx) => {}
+        }
+    });
     let close_control = control.clone();
     let stop_ui = stop.clone();
     tasks.spawn(async move {
@@ -841,7 +871,8 @@ async fn audio_pump(
                 let recovered = if realtime && out.as_ref().is_some_and(AudioOut::owns_audio) {
                     crate::audio_pacing::recoverable_source_frames(late, mix_rate, media_mix.len() / 2)
                 } else { 0 };
-                let skipped = missed - recovered;
+                // recovered 可能大于 missed（放宽到两块恢复时），必须饱和相减，否则 u64 回绕成天文数字。
+                let skipped = missed.saturating_sub(recovered);
                 let recovery_deadline = (recovered != 0).then(||
                     scheduled.into_std() + crate::audio_pacing::RECOVERY_DEADLINE);
                 pacing.observe_tick(missed, skipped, late);
@@ -973,7 +1004,7 @@ pub(crate) async fn video_pump(
     resource_lifecycle: bool,
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
-    video_rx: mpsc::UnboundedReceiver<SourceEvent>,
+    video_rx: crate::video_queue::Receiver,
     carwith_profile: Option<String>, fps:u32, source_owner:Option<u64>,
 ) {
     let diagnostic_phase = VideoLogLease(source_owner.and_then(crate::carwith_source::diagnostic_phase));
@@ -984,6 +1015,7 @@ pub(crate) async fn video_pump(
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;
+    let mut slow_writes = crate::screen_write::SlowWriteTrace::default();
     // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
     let mut pending_size: Option<(u32, u32)> = None;
     // 编码器真实尺寸（最后一次 EncoderResolution）。VideoConfig/画布都以它为准；
@@ -991,20 +1023,37 @@ pub(crate) async fn video_pump(
     let mut encoder_size: Option<(u32, u32)> = None;
     let mut before_ready_units = 0u64;
     let mut video_rx = video_rx;
+    let mut recovering_backlog = false;
+    let mut waiting_for_live_sync = false;
+    let mut last_backlog_request = None;
     // 16ms tick：仅用于 keepAlive 节拍（真帧由视频泵推送）
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     loop {
+        if recovering_backlog
+            && last_backlog_request.is_none_or(|at: tokio::time::Instant| at.elapsed() >= Duration::from_secs(3)) {
+            if let Some(s) = &sender {
+                last_backlog_request = Some(tokio::time::Instant::now());
+                s.note_keyframe_request("backlog_recovery");
+                if let Some(owner) = source_owner { crate::carwith_source::request_fresh_video(owner); }
+                else { crate::emit_force_keyframe(); }
+            }
+        }
         tokio::select! {
             _ = stop_v.notified() => return,
             command = screen_ready_rx.recv(), if commands_open => match command {
                 Some(crate::screen_session::ScreenCommand::Install(mut s)) => {
                     diagnostic_phase.set_streaming(false);
-                    converter.set_target(s.receiver_size());
+                    converter.set_target(s.receiver_size(), video_pipeline.lock().display_max_fps);
                     converted.clear();
                     if let Some((w, h)) = pending_size.take() {
                         s.set_size(w, h);
                     }
+                    s.activate_keyframe_trace();
+                    s.note_keyframe_request("install");
                     sender = Some(s);
+                    recovering_backlog = false;
+                    waiting_for_live_sync = false;
+                    last_backlog_request = None;
                     crate::emit_force_keyframe();
                     if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
@@ -1012,13 +1061,14 @@ pub(crate) async fn video_pump(
                 Some(crate::screen_session::ScreenCommand::InstallIfOwned { sender: mut next, modes, revision, reply }) => {
                     let accepted = {
                         let state = modes.lock();
-                        if state.can_restore_screen(revision) {
+                        if state.can_restore_screen(revision) && next.session_is_live() {
                             diagnostic_phase.set_streaming(false);
-                            converter.set_target(next.receiver_size());
+                            converter.set_target(next.receiver_size(), video_pipeline.lock().display_max_fps);
                             converted.clear();
                             next.set_resource_grant(modes.clone(),revision);
                             if let Some((w,h)) = pending_size.take() { next.set_size(w,h); }
                             video_pipeline.lock().video_stream="READY".into();
+                            next.activate_keyframe_trace();
                             sender = Some(next);
                             true
                         } else { false }
@@ -1026,6 +1076,10 @@ pub(crate) async fn video_pump(
                     let _ = reply.send(accepted);
                     emit_log(&format!("SCREEN-LIFECYCLE: video pump install revision={revision} accepted={accepted}"));
                     if accepted {
+                        recovering_backlog = false;
+                        waiting_for_live_sync = false;
+                        last_backlog_request = None;
+                        if let Some(s) = &sender { s.note_keyframe_request("resume"); }
                         if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                         crate::emit_force_keyframe();
                     }
@@ -1034,6 +1088,9 @@ pub(crate) async fn video_pump(
                     diagnostic_phase.set_streaming(false);
                     converter.pause(); converted.clear();
                     drop(sender.take());
+                    recovering_backlog = false;
+                    waiting_for_live_sync = false;
+                    last_backlog_request = None;
                     let _=reply.send(());
                     emit_log("VIDEO: old sender released; screen lifecycle pause acknowledged");
                 }
@@ -1043,14 +1100,32 @@ pub(crate) async fn video_pump(
                 },
             },
             ev = async {
-                if let Some(ev)=converted.pop_front() {(true,Some(ev))}else{(false,video_rx.recv().await)}
+                if !converted.is_empty() {
+                    if let Some(gap) = video_rx.take_discontinuity() { (false, Some(gap)) }
+                    else { (true, converted.pop_front()) }
+                } else {
+                    let connection = sender.as_ref().and_then(ScreenSender::connection_id);
+                    (false,video_rx.recv(connection).await)
+                }
             } => { let (processed,ev)=ev; match ev {
+                Some(SourceEvent::VideoBacklogDropped { frames, bytes, oldest_ms }) => {
+                    converted.clear();
+                    converter.discard_backlog();
+                    recovering_backlog = sender.is_some();
+                    waiting_for_live_sync = recovering_backlog;
+                    if let Some(s) = sender.as_mut() {
+                        s.reset_source();
+                        emit_log(&format!("VIDEO-QUEUE: recovery conn={:?} dropped_frames={frames} dropped_bytes={bytes} oldest_ms={oldest_ms}; waiting for live sync", s.connection_id()));
+                    }
+                }
                 Some(SourceEvent::ResetVideoSource) => {
                     encoder_size = None; pending_size = None;
-                    converter.reset();converted.clear();
+                    converter.set_source_fps(None); converter.reset();converted.clear();
+                    waiting_for_live_sync = recovering_backlog;
                     if let Some(s) = sender.as_mut() { s.reset_source(); }
                     emit_log("CARWITH-VIDEO: fresh source round; waiting for current configuration and IDR");
                 }
+                Some(SourceEvent::EncoderFrameRate(rate)) => converter.set_source_fps(Some(rate)),
                 Some(SourceEvent::EncoderResolution { width, height }) => {
                     // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
                     // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
@@ -1071,6 +1146,16 @@ pub(crate) async fn video_pump(
                     };
                     if !processed {
                         stats.lock().source_units += 1;
+                        if recovering_backlog && (waiting_for_live_sync || origin == FrameOrigin::Cached) {
+                            match crate::screen::recovery_access_unit(codec, &data, origin) {
+                                crate::screen::RecoveryAccessUnit::Sync => waiting_for_live_sync = false,
+                                crate::screen::RecoveryAccessUnit::Parameters => {}
+                                crate::screen::RecoveryAccessUnit::Skip => continue,
+                            }
+                        }
+                        if let Some(s) = &sender {
+                            s.observe_source_sync(&data, pts_us, codec, origin, video_rx.last_dequeue_age_ms());
+                        }
                         if transcode {
                             let allowed=sender.as_ref().map(|s|s.hevc_allowed()).unwrap_or(false);
                             // Do not initialize a codec until the current screen transport is installed.
@@ -1106,27 +1191,30 @@ pub(crate) async fn video_pump(
                         } else {
                             pts_us
                         };
-                        let written=if resource_lifecycle {
-                            let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
-                            crate::screen_write::with_progress(s.send_video_annexb_from(&data,pts,origin), ||
-                                video_pipeline.lock().video_tcp.as_ref()
-                                    .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
-                        } else { s.send_video_annexb_from(&data,pts,origin).await };
+                        let written = slow_writes.write(s.connection_id(), "frame", &video_pipeline,
+                            resource_lifecycle, s.send_video_annexb_from(&data,pts,origin)).await;
                         if let Err(error) = written {
                             emit_log(&format!("VIDEO: write failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
                             if resource_lifecycle {
                                 diagnostic_phase.set_streaming(false);
-                                drop(sender.take());
                                 video_pipeline.lock().retire_video_tcp();
-                                emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
+                                s.report_transport_failure(&error);
+                                drop(sender.take());
                                 continue;
                             }
                             emit_state("ended", "屏幕流写失败（请检查网络及车机会话）");
                             return;
                         }
                         let written_frames = s.frames_sent() - before_frames;
-                        if written_frames > 0 { diagnostic_phase.set_streaming(true); }
+                        if written_frames > 0 {
+                            diagnostic_phase.set_streaming(true);
+                            if recovering_backlog {
+                                recovering_backlog = false;
+                                last_backlog_request = None;
+                                emit_log(&format!("VIDEO-QUEUE: recovered conn={:?} first_frame_pts_us={pts}", s.connection_id()));
+                            }
+                        }
                         let mut st = stats.lock();
                         let first_write = written_frames > 0 && st.frames == 0;
                         st.frames += written_frames;
@@ -1154,20 +1242,16 @@ pub(crate) async fn video_pump(
                 }
                 // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                 if let Some(s) = sender.as_mut() {
-                    let written=if resource_lifecycle {
-                        let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
-                        crate::screen_write::with_progress(s.maybe_send_keep_alive(), ||
-                            video_pipeline.lock().video_tcp.as_ref()
-                                .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
-                    } else { s.maybe_send_keep_alive().await };
+                    let written = slow_writes.write(s.connection_id(), "keepalive", &video_pipeline,
+                        resource_lifecycle, s.maybe_send_keep_alive()).await;
                     if let Err(error) = written {
                         emit_log(&format!("VIDEO: keepAlive failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                         video_pipeline.lock().video_stream="FAILED".into();
                         if resource_lifecycle {
                             diagnostic_phase.set_streaming(false);
-                            drop(sender.take());
                             video_pipeline.lock().retire_video_tcp();
-                            emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
+                            s.report_transport_failure(&error);
+                            drop(sender.take());
                             continue;
                         }
                         emit_state("ended", "屏幕保活写失败");
@@ -1225,12 +1309,88 @@ mod video_pump_tests {
     }
     use tokio::io::AsyncReadExt;
     #[tokio::test]
+    async fn backlog_recovery_writes_fresh_sync_on_the_same_encrypted_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car, _) = listener.accept().await.unwrap();
+        let (commands, rx) = mpsc::channel(2);
+        let (source, video_rx) = crate::video_queue::channel();
+        let stats = Arc::new(Mutex::new(PumpStat::default()));
+        let stop = Arc::new(Notify::new());
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let pump = tokio::spawn(video_pump(stop, stats, true, pipeline, rx, video_rx, None, 30, None));
+        commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
+            phone.into_split().1, crate::screen::ScreenCipher::ChaCha([7; 32]), 1920, 720, false,
+        ))).await.unwrap();
+        tokio::task::yield_now().await;
+        let sync = |stamp, origin, tag| SourceEvent::VideoFrameTagged {
+            pts_us: stamp, codec: crate::video_format::VideoCodec::H264, origin,
+            data: vec![0,0,1,0x67,0x42,0,0x1f,0,0,1,0x68,1,0,0,1,0x65,tag],
+        };
+        async fn read_frame(socket: &mut tokio::net::TcpStream, nonce: u64) -> Vec<u8> {
+            let mut header = [0;128];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[4], 1, "configuration must precede the new GOP");
+            let mut body = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[4], 0);
+            body.resize(u32::from_le_bytes(header[..4].try_into().unwrap()) as usize, 0);
+            socket.read_exact(&mut body).await.unwrap();
+            crate::crypto::chacha_open(&[7;32], &crate::crypto::nonce64(nonce), &body, &header).unwrap()
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            source.send(sync(1000, FrameOrigin::Live, 2)).unwrap();
+            assert_eq!(read_frame(&mut car, 0).await, [0,0,0,2,0x65,2]);
+            // Fill the FIFO without yielding, as if the video pump were writing a large frame.
+            for n in 0..33 {
+                source.send(SourceEvent::VideoFrame {pts_us:2000+n,data:vec![0,0,1,0x41,3]}).unwrap();
+            }
+            source.send(sync(3000, FrameOrigin::Cached, 4)).unwrap();
+            source.send(sync(4000, FrameOrigin::Live, 5)).unwrap();
+            assert_eq!(read_frame(&mut car, 1).await, [0,0,0,2,0x65,5]);
+        }).await.unwrap();
+        pump.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_recovery_keeps_requesting_sync_after_multiple_dropped_windows() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_car, _) = listener.accept().await.unwrap();
+        let (commands, rx) = mpsc::channel(2);
+        let (source, video_rx) = crate::video_queue::channel();
+        let stats = Arc::new(Mutex::new(PumpStat::default()));
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let mut sender = ScreenSender::new(phone.into_split().1,
+            crate::screen::ScreenCipher::ChaCha([7; 32]), 1920, 720, false);
+        sender.attach_diagnostics(pipeline.clone(), 8);
+        commands.send(crate::screen_session::ScreenCommand::Install(sender)).await.unwrap();
+        let pump = tokio::spawn(video_pump(Arc::new(Notify::new()), stats.clone(), true, pipeline.clone(),
+            rx, video_rx, None, 30, None));
+        tokio::task::yield_now().await;
+        let trace = pipeline.lock().keyframe_trace.upgrade().expect("installed sender trace");
+
+        for window in 0..3 {
+            for n in 0..33 {
+                source.send(SourceEvent::VideoFrame { pts_us: window * 100 + n, data: vec![0, 0, 1, 0x41, 3] }).unwrap();
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(trace.pending_with_reason("backlog_recovery") >= 3);
+        assert_eq!(stats.lock().frames, 0, "incremental frames must not leave the pump before sync");
+        pump.abort();
+    }
+
+    #[tokio::test]
     async fn negotiation_command_sender_drop_does_not_stop_video_or_keepalive() {
         for recovery in [false,true] {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let phone=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (mut car,_)=listener.accept().await.unwrap();let (_,write)=phone.into_split();
-            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
+            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=crate::video_queue::channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
             let pump=crate::callback_context::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,None,30,None));
@@ -1292,7 +1452,6 @@ impl AudioPumpThread {
         let audio_guard = shutdown.track_audio_thread();
         std::thread::Builder::new().name("hypercar-audio".into()).spawn(move || {
             let audio_guard = audio_guard;
-            crate::thread_prio::apply("hypercar-audio", -16);
             match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => {
                     if started.send(Ok(())).is_ok() {
@@ -1509,6 +1668,7 @@ pub enum CarLifeEvent {
     SourceReset { cache_cleared: Option<Arc<Notify>> },
     /// Replay for a new screen transport without resetting active audio/navigation.
     VideoReplay,
+    EncoderFrameRate(u32),
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },
     VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },

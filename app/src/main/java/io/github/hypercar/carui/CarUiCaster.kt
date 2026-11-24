@@ -57,6 +57,7 @@ object CarUiCaster {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var caster: SpikeCaster? = null
+    private var encoderTargetFps = 0
     @Volatile private var displayId = -1
     @Volatile private var displayService: IBinder? = null
     private var cpuLock: PowerManager.WakeLock? = null
@@ -70,7 +71,43 @@ object CarUiCaster {
     private val lifecycle = SessionResourceLifecycle()
     private enum class RecoveryResult { SKIPPED, FAILED, REBUILT }
 
+    /**
+     * 抖动保活：会话因网络闪断结束时，先不释放首页虚显与编码器，等重连复用同一块屏。
+     * 这样车机不会黑屏、手机端也不退出，重连后 startLocked 的 "already running" 分支直接接管。
+     */
+    private val holdUntilElapsed = AtomicLong(0)
+    private var holdJob: kotlinx.coroutines.Job? = null
+    private const val HOLD_TIMEOUT_MILLIS = 20_000L
+
+    val holding: Boolean get() = running && displayId > 0 && SystemClock.elapsedRealtime() < holdUntilElapsed.get()
+
+    /** @return true 表示界面已进入保活（调用方不必再拆除）。 */
+    fun holdForReconnect(reason: String, timeoutMs: Long = HOLD_TIMEOUT_MILLIS): Boolean {
+        if (!running || displayId <= 0) return false
+        holdUntilElapsed.set(SystemClock.elapsedRealtime() + timeoutMs)
+        holdJob?.cancel()
+        holdJob = scope.launch {
+            kotlinx.coroutines.delay(timeoutMs + 200)
+            if (running && displayId > 0 && SystemClock.elapsedRealtime() >= holdUntilElapsed.get()) {
+                HyperCarRepo.log("CARUI: 保活超时，拆除首页虚显 display=$displayId")
+                stopAsync(force = true)
+            }
+        }
+        HyperCarRepo.log("CARUI: 抖动保活 ${timeoutMs}ms display=$displayId reason=$reason")
+        return true
+    }
+
+    private fun clearHold(message: String) {
+        if (holdUntilElapsed.get() != 0L) {
+            holdUntilElapsed.set(0)
+            HyperCarRepo.log("CARUI: $message")
+        }
+        holdJob?.cancel()
+        holdJob = null
+    }
+
     suspend fun start(context: Context, current: () -> Boolean = { true }): String {
+        if (holding) clearHold("重连复用保活中的首页虚显 display=$displayId")
         val ticket = lifecycle.ticket()
         return lifecycle.start(ticket, current, ::stopLocked) {
             startLocked(context.applicationContext) { lifecycle.isCurrent(ticket) && current() }
@@ -162,13 +199,6 @@ object CarUiCaster {
                     log("event=${event?.first ?: "state_changed"} eventElapsedMs=${event?.second ?: SystemClock.elapsedRealtime()} $state")
                     previous = state
                 }
-                // 锁屏/息屏瞬间不主动拆掉并重建源虚拟屏：旧代码收到 SCREEN_OFF 立即 stopLocked()/startLocked()，
-                // 会把 2615 旧屏和编码器释放后新建 2617 新屏，车机看到的就是“跟着锁住再恢复”的一闪。
-                // 这里只记录息屏/锁屏状态；源屏真被系统移除、shell 服务断开或帧停滞时，仍由下面的看门狗恢复。
-                val suspended = power?.isInteractive == false || keyguard?.isDeviceLocked == true
-                if (event?.first == Intent.ACTION_SCREEN_OFF && id > 0 && suspended) {
-                    log("screen-off/locked display=$id；保留现有源屏与编码器，不主动重建（等待真停滞/断线看门狗）")
-                }
                 val originalService = displayService
                 if (recovery == null && originalService != null &&
                     (originalService !== userService || (displays != null && id > 0 && display == null))) {
@@ -238,8 +268,11 @@ object CarUiCaster {
 
     private suspend fun startLocked(context: Context, keepAudio: Boolean = false, current: () -> Boolean): String {
         val desiredCodec = SettingsStore.preferredVideoCodec
-        if (running && caster?.preferredCodec != desiredCodec) {
-            HyperCarRepo.log("CARUI: video codec preference changed; rebuilding home/map encoders")
+        val requested = SettingsStore.encodingPlan
+        val limited = SettingsStore.receiverMaxFps != null
+        if (running && (caster?.preferredCodec != desiredCodec || encoderTargetFps != requested.fps ||
+                caster?.receiverRateLimited != limited)) {
+            HyperCarRepo.log("CARUI: rebuilding home/map encoders codec=$desiredCodec target_fps=${requested.fps}")
             stopLocked(keepAudio)
         }
         if (running) {
@@ -256,15 +289,14 @@ object CarUiCaster {
                 runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
                 if (MapController.mapActive) MapController.refreshVideoSize()
             }
-            return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
+            return "已经在跑（display=$displayId，已重新上报 ${width}x$height，复用保活界面）"
         }
-        val requested = SettingsStore.encodingPlan
         var lastError: Exception? = null
         var encoder = ""
         for (candidate in requested.encoderCandidates()) {
             if (!current()) return "会话已停止，取消编码启动"
             val next = SpikeCaster(width = candidate.width, height = candidate.height, fps = candidate.fps,
-                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec)
+                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec, receiverRateLimited = limited)
             try {
                 encoder = next.startEncoder()
             } catch (e: Exception) {
@@ -274,13 +306,14 @@ object CarUiCaster {
                 continue
             }
             caster = next
+            encoderTargetFps = requested.fps
             plan = candidate
             width = candidate.width
             height = candidate.height
             break
         }
         val c = caster ?: return "编码器启动失败: ${lastError?.message}"
-        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} dpi=$DPI $encoder")
+        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} requested_fps=${SettingsStore.videoFps} declared_max_fps=${SettingsStore.receiverMaxFps} effective_fps=${requested.fps} encoder_fps=${plan.fps} dpi=$DPI $encoder")
         val surface = c.encoderSurface ?: run {
             c.stop()
             caster = null
@@ -353,6 +386,7 @@ object CarUiCaster {
                 MapController.requestExit()
                 return
             }
+            if (MapController.overlayKey(key) || CarReceiverUi.state.value.limits.blockMapApp) return
             MapController.fullscreenDisplayId
         } else displayId
         if (target <= 0) return
@@ -381,7 +415,12 @@ object CarUiCaster {
     }
 
     /** Retire synchronously; all cleanup stays off the UI thread. */
-    fun stopAsync() {
+    fun stopAsync(force: Boolean = false) {
+        if (!force && holding) {
+            HyperCarRepo.log("CARUI: 保活期内跳过拆除 display=$displayId，等待重连复用")
+            return
+        }
+        clearHold("拆除保活界面")
         val retired = lifecycle.retire()
         scope.launch { lifecycle.stop(retired, ::stopLocked) }
     }

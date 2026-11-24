@@ -16,8 +16,6 @@ internal class SplitPlaybackAudio {
         val live = AtomicBoolean(true)
         val bytes = AtomicLongArray(2)
         val nonzero = AtomicLongArray(2)
-        val shortReads = AtomicLongArray(2)
-        val underrunBytes = AtomicLongArray(2)
     }
     private var session: Session? = null
     @Volatile var status = "split stopped"
@@ -104,7 +102,6 @@ internal class SplitPlaybackAudio {
     }
 
     private fun read(current: Session, lane: Int, record: AudioRecord, output: ParcelFileDescriptor) {
-        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) }
         try {
             ParcelFileDescriptor.AutoCloseOutputStream(output).use { stream ->
                 val buffer = ByteArray(3840)
@@ -112,19 +109,14 @@ internal class SplitPlaybackAudio {
                 while (current.live.get()) {
                     val count = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
                     check(count > 0) { "policy read=$count" }
-                    if (count < buffer.size) {
-                        current.shortReads.addAndGet(lane, 1)
-                        current.underrunBytes.addAndGet(lane, (buffer.size - count).toLong())
-                        java.util.Arrays.fill(buffer, count, buffer.size, 0)
-                    }
                     var nonzero = 0L
                     for (i in 0 until count - 1 step 2) if (buffer[i] != 0.toByte() || buffer[i + 1] != 0.toByte()) nonzero++
                     current.bytes.addAndGet(lane, count.toLong())
                     current.nonzero.addAndGet(lane, nonzero)
-                    stream.write(buffer, 0, buffer.size)
+                    stream.write(buffer, 0, count)
                     val now = SystemClock.elapsedRealtime()
                     if (lane == 0 && now - lastLog >= 5000) {
-                        val detail = "split UID=${current.uid} MEDIA bytes=${current.bytes.get(0)} nonzero=${current.nonzero.get(0)} short=${current.shortReads.get(0)} underrun=${current.underrunBytes.get(0)} NAV bytes=${current.bytes.get(1)} nonzero=${current.nonzero.get(1)} short=${current.shortReads.get(1)} underrun=${current.underrunBytes.get(1)}; cumulative, no content"
+                        val detail = "split UID=${current.uid} MEDIA bytes=${current.bytes.get(0)} nonzero=${current.nonzero.get(0)} NAV bytes=${current.bytes.get(1)} nonzero=${current.nonzero.get(1)}; cumulative, no content"
                         synchronized(this) { if (session === current) status = detail }
                         android.util.Log.i("HyperCar", "CARUI-AUDIO: $detail")
                         lastLog = now

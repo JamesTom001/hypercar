@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.view.Surface
 import io.github.hypercar.session.HyperCarRepo
-import io.github.hypercar.spike.MapCompat
 import io.github.hypercar.spike.SpikeDisplay
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CoroutineScope
@@ -14,40 +13,43 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** One application task can move between a full-sized pane and the home card. */
-internal class MediaCardProjection(context: Context, private val packageName: String) {
+internal class MediaCardProjection(context: Context, private val packageName: String, private val dialer: String?) {
     private val app = context.applicationContext
     val size = PhoneProjectionSize.read(context)
     val error = MutableStateFlow<String?>(null)
+    val expandedWindowReady = MutableStateFlow(false)
+    val stabilizeExpandedWindow = ShortVideoApps.isSupported(packageName)
 
-    @Volatile private var desired: Request? = null
-    @Volatile private var closed = false
+    private val input = ProjectionSurfaceInput<Request> { id, action, x, y, downTime ->
+        SpikeShell.motion(id, action, x, y, downTime)
+    }
+    private val desired get() = input.desired
+    private enum class CloseReason { UserDismissed, ViewDisposed }
+    @Volatile private var closeReason: CloseReason? = null
+    private val closed get() = closeReason != null
+    private val endProjectedTask get() = closeReason == CloseReason.UserDismissed && stabilizeExpandedWindow
     @Volatile private var attachment: Attachment? = null
     private var displayId = -1
     private var tasksBeforeLaunch: List<MediaTaskWindow.Task>? = null
     private var needsFullscreenReset = false
-    @Volatile private var compatEnabled = false
+    private var shortVideoWindow: MediaTaskWindow.ExpandedShortVideo? = null
 
-    private data class Request(val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean)
+    private data class Request(
+        val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean,
+        val viewWidth: Int, val viewHeight: Int,
+    )
     private data class Attachment(val request: Request, val surface: Surface, val displayId: Int)
 
     fun show(texture: SurfaceTexture, viewWidth: Int, viewHeight: Int, expanded: Boolean) {
         if (closed || viewWidth <= 0 || viewHeight <= 0) return
         val viewport = if (expanded) size.expanded(viewWidth, viewHeight) else size
-        val request = Request(texture, viewport, expanded && viewport.width > viewport.height)
-        val existing = attachment
-        HyperCarRepo.log("VIDEO-CARD: show package=$packageName view=${viewWidth}x${viewHeight} expanded=$expanded viewport=${viewport.width}x${viewport.height} texture=${System.identityHashCode(texture)} display=$displayId existingExpanded=${existing?.request?.expanded} desiredSame=${desired == request}")
-        // 旧首页卡片的 SurfaceTexture 在展开面板替换过程中可能迟到一次 show(false)。
-        // 此时不应把已经展开的应用任务回收到竖屏卡片；保持现有展开附件，等待显式 close/hide。
-        if (displayId > 0 && existing?.request?.expanded == true && !request.expanded) {
-            HyperCarRepo.log("VIDEO-CARD: package=$packageName stale card callback ignored display=$displayId; keeping expanded panel")
-            desired = existing.request
-            return
-        }
+        val request = Request(texture, viewport, expanded && viewport.width > viewport.height, viewWidth, viewHeight)
+        if (!input.replace(request)) return
+        expandedWindowReady.value = false
         texture.setDefaultBufferSize(viewport.width, viewport.height)
-        if (desired == request) return
-        desired = request
         error.value = null
         scope.launch {
             changes.withLock {
@@ -61,24 +63,30 @@ internal class MediaCardProjection(context: Context, private val packageName: St
                 try {
                     if (displayId > 0 && needsFullscreenReset && !request.expanded && !resetWindowMode()) {
                         HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId rebuilding for home card")
-                        releaseDisplay(restoreFullscreen = false)
+                        releaseDisplay(restoreWindow = false)
+                    }
+                    if (displayId > 0 && shortVideoWindow != null && !request.expanded && !resetOrientation()) {
+                        HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId rebuilding for home orientation")
+                        releaseDisplay(restoreWindow = false)
                     }
                     if (!isCurrent(request)) return@withLock
                     if (displayId > 0) {
+                        if (stabilizeExpandedWindow && request.expanded && shortVideoWindow == null) prepareExpandedShortVideo()
+                        if (!isCurrent(request)) return@withLock
                         val result = SpikeShell.updateDisplaySurface(
                             displayId, surface, viewport.width, viewport.height, viewport.dpi,
                         )
-                        if (result.startsWith("OK")) {
+                        if (result.startsWith("OK") && applyWindowMode(request)) {
                             attachment?.surface?.release()
                             attachment = Attachment(request, surface, displayId)
                             attached = true
-                            if (isCurrent(request)) applyWindowMode(request)
+                            markWindowReady(request)
                             HyperCarRepo.log("VIDEO-CARD: package=$packageName surface reattached display=$displayId size=${viewport.width}x${viewport.height} dpi=${viewport.dpi}")
                             return@withLock
                         }
                         releaseDisplay()
                     }
-                    attached = open(request, surface)
+                    if (isCurrent(request)) attached = open(request, surface)
                 } finally {
                     if (!attached) surface.release()
                 }
@@ -93,11 +101,6 @@ internal class MediaCardProjection(context: Context, private val packageName: St
             if (isCurrent(request)) error.value = "应用当前无法启动"
             return false
         }
-        if (request.expanded) {
-            val compat = runCatching { MapCompat.enable(packageName) }.getOrElse { it.message ?: "am compat 失败" }
-            compatEnabled = true
-            HyperCarRepo.log("VIDEO-CARD: package=$packageName $compat")
-        }
         SpikeShell.connect(app)
         if (!isCurrent(request)) return false
         val previous = runCatching { MediaTaskWindow.snapshot() }.getOrNull()
@@ -110,20 +113,24 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         if (id == null || id <= 0) {
             if (isCurrent(request)) error.value = "无法创建应用画面，请检查 Shizuku"
             HyperCarRepo.log("VIDEO-CARD: display failed package=$packageName result=${created.take(120)}")
-            if (compatEnabled) { runCatching { MapCompat.disable(packageName) }; compatEnabled = false }
             return false
         }
         var launched = false
         try {
             if (!isCurrent(request)) return false
+            displayId = id
+            tasksBeforeLaunch = previous
+            if (stabilizeExpandedWindow && request.expanded) prepareExpandedShortVideo()
+            if (!isCurrent(request)) return false
             val result = SpikeDisplay.amStartLauncherOnDisplay(id, component.flattenToShortString())
-            launched = result.ok && MediaTaskWindow.confirmLaunch(id, packageName, stillOpen = { !closed }) {
-                displayId = id
-                tasksBeforeLaunch = previous
-                if (isCurrent(request)) applyWindowMode(request)
+            var windowUsable = true
+            val confirmed = result.ok && MediaTaskWindow.confirmLaunch(id, packageName, stillOpen = { !closed }) {
+                windowUsable = applyWindowMode(request)
             }
+            launched = confirmed && windowUsable
             if (launched) {
                 attachment = Attachment(request, surface, id)
+                markWindowReady(request)
             } else if (isCurrent(request)) {
                 error.value = if (result.ok) "应用未能在投屏中保持打开" else "应用未能在卡片中打开"
             }
@@ -137,7 +144,10 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     }
 
     fun hide(texture: SurfaceTexture) {
-        if (desired?.texture === texture) desired = null
+        if (desired?.texture === texture) {
+            input.replace(null)
+            expandedWindowReady.value = false
+        }
         scope.launch {
             changes.withLock {
                 val old = attachment?.takeIf { it.request.texture === texture } ?: return@withLock
@@ -149,31 +159,71 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         }
     }
 
-    fun close() {
-        closed = true
-        desired = null
+    fun dismiss() = close(CloseReason.UserDismissed)
+
+    fun dispose() = close(CloseReason.ViewDisposed)
+
+    private fun close(reason: CloseReason) {
+        if (closed) return
+        closeReason = reason
+        input.replace(null)
+        expandedWindowReady.value = false
         scope.launch { changes.withLock { releaseDisplay() } }
     }
 
     fun touch(texture: SurfaceTexture, action: Int, x: Float, y: Float, downTime: Long) {
         val display = attachment?.takeIf { isCurrent(it.request) && it.request.texture === texture } ?: return
+        if (!allowsInteraction(CarReceiverUi.state.value.limits)) {
+            cancelTouch()
+            return
+        }
         val viewport = display.request.size
         val px = (x * viewport.width).toInt().coerceIn(0, viewport.width - 1)
         val py = (y * viewport.height).toInt().coerceIn(0, viewport.height - 1)
-        SpikeShell.motion(display.displayId, action, px, py, downTime)
+        input.touch(display.request, display.displayId, action, px, py, downTime)
     }
+
+    fun allowsInteraction(limits: UiLimits) = limits.allowsProjection(packageName, dialer)
+
+    fun cancelTouch() = input.cancel()
 
     private fun isCurrent(request: Request) = !closed && desired === request
 
-    private suspend fun applyWindowMode(request: Request) {
-        if (!request.expanded) return
+    private suspend fun markWindowReady(request: Request) {
+        if (!stabilizeExpandedWindow || !request.expanded) return
+        withContext(Dispatchers.Main.immediate) {
+            if (isCurrent(request)) expandedWindowReady.value = true
+        }
+    }
+
+    private suspend fun prepareExpandedShortVideo() {
+        val prepared = MediaTaskWindow.prepareExpandedShortVideo(displayId)
+        shortVideoWindow = prepared
+        HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId shortVideoOrientationLocked=${prepared.ready}")
+    }
+
+    private suspend fun resetOrientation(): Boolean {
+        val original = shortVideoWindow?.restoreIgnoreOrientation
+        if (original != null) {
+            val restored = MediaTaskWindow.setIgnoreOrientationRequest(displayId, original)
+            HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId orientationRestored=$restored")
+            if (!restored) return false
+        }
+        shortVideoWindow = null
+        return true
+    }
+
+    private suspend fun applyWindowMode(request: Request): Boolean {
+        if (!isCurrent(request) || !request.expanded) return true
+        if (stabilizeExpandedWindow && shortVideoWindow?.ready != true) return true
         val viewport = request.size
         needsFullscreenReset = true
         val expanded = runCatching {
             MediaTaskWindow.expand(displayId, packageName, viewport.width, viewport.height)
         }.getOrDefault(false)
-        if (!expanded) resetWindowMode()
+        val usable = expanded || resetWindowMode()
         HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId expandedWindow=$expanded")
+        return usable || !stabilizeExpandedWindow
     }
 
     private suspend fun resetWindowMode(): Boolean {
@@ -183,27 +233,27 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         return restored
     }
 
-    private suspend fun releaseDisplay(restoreFullscreen: Boolean = true) {
-        if (needsFullscreenReset && restoreFullscreen) resetWindowMode()
+    private suspend fun releaseDisplay(restoreWindow: Boolean = true) {
+        if (needsFullscreenReset && restoreWindow) resetWindowMode()
+        if (restoreWindow && !endProjectedTask) resetOrientation()
         if (displayId > 0) releaseProjectionDisplay(displayId, tasksBeforeLaunch)
         displayId = -1
         tasksBeforeLaunch = null
         needsFullscreenReset = false
+        shortVideoWindow = null
         attachment?.surface?.release()
         attachment = null
     }
 
     private suspend fun releaseProjectionDisplay(id: Int, previous: List<MediaTaskWindow.Task>?) {
         try {
-            runCatching { MediaTaskWindow.releaseTasks(id, packageName, previous) }.onFailure {
+            runCatching {
+                MediaTaskWindow.releaseTasks(id, packageName, previous, closeProjectedTasks = endProjectedTask)
+            }.onFailure {
                 HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$id task cleanup failed: ${it.javaClass.simpleName}")
             }
         } finally {
             SpikeShell.releaseDisplay(id)
-            if (compatEnabled) {
-                runCatching { MapCompat.disable(packageName) }
-                compatEnabled = false
-            }
         }
     }
 

@@ -13,8 +13,6 @@ class ShellPlaybackAudio {
     private class Session(val record: AudioRecord, val output: ParcelFileDescriptor,
         val owner: IBinder, val death: IBinder.DeathRecipient, val volume: CaptureVolume) {
         val live = AtomicBoolean(true)
-        @Volatile var shortReads = 0L
-        @Volatile var underrunBytes = 0L
     }
     private var session: Session? = null
     @Volatile var status = "stopped"
@@ -90,10 +88,8 @@ class ShellPlaybackAudio {
             val format = AudioFormat.Builder().setSampleRate(48000)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
-            // 48kHz/16-bit/stereo = 192 B/ms；153600B ≈ 800ms，给被前台 App 抢占的 shell 采集线程留恢复余量。
-            val captureBufferBytes = 153_600
             val builder = AudioRecord.Builder().setAudioSource(8).setAudioFormat(format)
-                .setBufferSizeInBytes(captureBufferBytes)
+                .setBufferSizeInBytes(153600) // ~800ms REMOTE_SUBMIX 采集缓冲：前台抢占时先吃缓冲再补采
             AudioRecord.Builder::class.java.getMethod("setContext", Context::class.java)
                 .invoke(builder, PlaybackAudioContext(context))
             val record = builder.build()
@@ -101,7 +97,6 @@ class ShellPlaybackAudio {
             check(record.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord not initialized" }
             record.startRecording()
             check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "not recording" }
-            android.util.Log.i("HyperCar", "CARUI-AUDIO: record buffer=${captureBufferBytes}B rate=${record.sampleRate} channels=${record.channelCount}")
             val captureVolume = CaptureVolume(context)
             volume = captureVolume
             val volumeStatus = captureVolume.acquire()
@@ -114,36 +109,29 @@ class ShellPlaybackAudio {
             session = current
             status = "capturing 48000Hz stereo PCM16; $volumeStatus"
             Thread({
-                val priority = runCatching {
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-                }.exceptionOrNull()
-                if (priority != null) {
-                    android.util.Log.w("HyperCar", "CARUI-AUDIO: URGENT_AUDIO priority failed: ${priority.message}")
-                }
                 try {
                     ParcelFileDescriptor.AutoCloseOutputStream(current.output).use { out ->
                         val bytes = ByteArray(3840) // 20ms, bounded pipe provides backpressure.
                         var lastInspect = android.os.SystemClock.elapsedRealtime()
                         var nonzero = false
+                        var shortReads = 0
+                        var totalBytes = 0L
                         while (current.live.get()) {
                             val count = record.read(bytes, 0, bytes.size, AudioRecord.READ_BLOCKING)
                             check(count > 0) { "AudioRecord.read=$count" }
-                            if (count < bytes.size) {
-                                current.shortReads++
-                                current.underrunBytes += (bytes.size - count)
-                                java.util.Arrays.fill(bytes, count, bytes.size, 0)
-                            }
+                            if (count < bytes.size) shortReads++
+                            totalBytes += count.toLong()
                             if (!nonzero) nonzero = (0 until count).any { bytes[it].toInt() != 0 }
                             val now = android.os.SystemClock.elapsedRealtime()
                             if (now - lastInspect >= 5_000) {
                                 val detail = runCatching { current.volume.inspect(!nonzero) }
                                     .getOrElse { "route inspection failed: ${it.cause?.message ?: it.message}" }
-                                status = "capturing 48000Hz stereo PCM16; $detail shortReads=${current.shortReads} underrunBytes=${current.underrunBytes}"
-                                android.util.Log.i("HyperCar", "CARUI-AUDIO: $detail shortReads=${current.shortReads} underrunBytes=${current.underrunBytes}")
+                                status = "capturing 48000Hz stereo PCM16; shortReads=$shortReads totalKB=${totalBytes / 1024}; $detail"
+                                android.util.Log.i("HyperCar", "CARUI-AUDIO: $detail")
                                 lastInspect = now
                                 nonzero = false
                             }
-                            out.write(bytes, 0, bytes.size)
+                            out.write(bytes, 0, count)
                         }
                     }
                 } catch (e: Exception) {

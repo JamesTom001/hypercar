@@ -261,16 +261,11 @@ pub(crate) fn current_pcm_due(scheduled: Instant, missed_frames: u64, rate: u32)
 
 pub(crate) const RECOVERY_DEADLINE: Duration = Duration::from_millis(60);
 
-/// Preserve up to two ready blocks when the audio worker is delayed by a short preemption.
-/// A single missed block was not enough on the Mate 60 foreground-app preemption cases.
+/// Preserve one missed block and the current block when both already exist.
 pub(crate) fn recoverable_source_frames(late: Duration, rate: u32, queued: usize) -> u64 {
     let slot = period(rate);
-    const BLOCK: usize = 352;
-    if late >= slot && late < slot * 3 && queued >= BLOCK * 3 {
-        ((queued / BLOCK).min(2) * BLOCK) as u64
-    } else {
-        0
-    }
+    // 放宽为：最多保留两块就绪数据，容忍 worker 一次短停顿（原 1 块太保守，抢占总掉音）。
+    if late >= slot && late < slot * 3 && queued >= 1056 { 352 + 352 } else { 0 }
 }
 
 pub(crate) fn interval(rate: u32) -> tokio::time::Interval {
@@ -315,12 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn short_recovery_keeps_two_ready_blocks_for_a_short_worker_stall() {
+    fn short_recovery_keeps_up_to_two_ready_blocks_for_a_short_worker_stall() {
         let rate = 48_000;
         let slot = period(rate);
-        assert_eq!(recoverable_source_frames(slot, rate, 1056), 704);
-        assert_eq!(recoverable_source_frames(slot * 3 - Duration::from_nanos(1), rate, 1056), 704);
-        for (late, queued) in [(slot - Duration::from_nanos(1), 1056), (slot, 704), (slot * 3, 1056), (slot * 5, 4096)] {
+        // 晚 1~3 个 slot 时按就绪深度补采：704 帧只够 1 块，1056 帧够 2 块。
+        assert_eq!(recoverable_source_frames(slot, rate, 704), 352);
+        assert_eq!(recoverable_source_frames(slot * 2 - Duration::from_nanos(1), rate, 704), 352);
+        assert_eq!(recoverable_source_frames(slot * 2, rate, 1056), 704);
+        assert_eq!(recoverable_source_frames(slot * 3 - Duration::from_nanos(1), rate, 1408), 704);
+        for (late, queued) in [(slot - Duration::from_nanos(1), 704), (slot, 703), (slot * 3, 4096), (slot * 5, 4096)] {
             assert_eq!(recoverable_source_frames(late, rate, queued), 0);
         }
     }
